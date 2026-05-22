@@ -1,0 +1,148 @@
+---
+name: garage
+
+description: |
+  Garage S3-compatible distributed object storage. Managed by BPM.
+  Scales 1 to N via the garage-rpc BOSH link for cluster peer discovery.
+  Cluster layout is auto-bootstrapped by the post-deploy hook on instance 0,
+  with opt-out via the garage.layout.manual property.
+
+packages:
+  - garage
+
+templates:
+  bin/drain.erb:               bin/drain
+  bin/env.sh.erb:              bin/env.sh
+  bin/pre-start.erb:           bin/pre-start
+  bin/post-start.erb:          bin/post-start
+  bin/post-deploy.erb:         bin/post-deploy
+  config/bpm.yml.erb:          config/bpm.yml
+  config/garage.toml.erb:      config/garage.toml
+
+provides:
+  - name: garage-rpc
+    type: garage-rpc
+    properties:
+      - garage.rpc_port
+
+consumes:
+  - name: garage-rpc
+    type: garage-rpc
+
+properties:
+  garage.rpc_port:
+    description: |
+      RPC inter-node port. Exported via the garage-rpc BOSH link so
+      peer nodes can discover this instance's RPC address at template
+      render time.
+    default: 3901
+
+  garage.s3_port:
+    description: S3 API bind port.
+    default: 3900
+
+  garage.admin_port:
+    description: |
+      Admin API bind port. Bound to loopback (127.0.0.1) only.
+      Used by BPM post-start health polling and the smoke-tests errand.
+    default: 3903
+
+  garage.s3_region:
+    description: S3 region label returned in API responses.
+    default: garage
+
+  garage.s3_root_domain:
+    description: |
+      Optional domain suffix for virtual-hosted-style bucket access
+      (e.g., ".s3.example.com"). Leave empty to disable vhost-style routing.
+    default: ""
+
+  garage.replication_factor:
+    description: |
+      Replication factor for stored objects.
+      1 = development (no redundancy).
+      3 = production (requires 3 or more nodes in distinct availability zones).
+    default: 1
+
+  garage.db_engine:
+    description: |
+      Metadata database engine.
+      lmdb  — high performance; recommended for production clusters.
+      sqlite — slower; more robust for dirty shutdowns; recommended for dev.
+      Note: sled was removed in v1.0 and must not be used.
+    default: lmdb
+
+  garage.metadata_dir:
+    description: |
+      Path for the LMDB metadata database. Must be on SSD-backed storage;
+      LMDB performance degrades severely on HDD under write load.
+    default: /var/vcap/store/garage/meta
+
+  garage.data_dir:
+    description: |
+      Path for object data blocks (1 MiB chunks by default).
+      Can be HDD-backed.
+    default: /var/vcap/store/garage/data
+
+  garage.block_size:
+    description: Data block size in bytes. Default is 1 MiB.
+    default: 1048576
+
+  garage.compression_level:
+    description: |
+      Zstd compression level for stored blocks. Range: -99 to 22.
+      1 = fast compression (default). 0 or 'none' disables compression.
+    default: 1
+
+  garage.metadata_fsync:
+    description: |
+      Enable extra fsync calls for LMDB write operations. Increases
+      corruption protection at the cost of write throughput.
+    default: false
+
+  garage.consistency_mode:
+    description: |
+      Read/write consistency mode.
+      consistent — full read-after-write consistency (default).
+      degraded   — read quorum lowered to 1; allows reads during partial failure.
+      dangerous  — both quorums lowered to 1; risk of split-brain.
+    default: consistent
+
+  garage.log_level:
+    description: "Log level. Values: trace, debug, info, warn, error."
+    default: info
+
+  garage.rpc_secret:
+    description: |
+      64-character hexadecimal RPC secret shared by all cluster nodes.
+      Serves as cluster membership authentication. Must be identical
+      on every node. No default — use CredHub interpolation.
+      Generate with: openssl rand -hex 32
+      Written to /var/vcap/jobs/garage/config/rpc_secret by pre-start.
+
+  garage.admin_token:
+    description: |
+      Bearer token for the Garage admin API. No default — use CredHub
+      interpolation. Written to /var/vcap/jobs/garage/config/admin_token
+      by pre-start.
+
+  garage.layout.manual:
+    description: |
+      When true, the post-deploy hook skips automatic layout bootstrapping.
+      The operator is responsible for running garage layout assign and
+      garage layout apply manually.
+    default: false
+
+  garage.layout.capacity:
+    description: |
+      Capacity string passed to garage layout assign -c during auto-bootstrap.
+      Supports T, G, M suffixes (e.g., 1T, 500G).
+    default: 1T
+
+  garage.bpm.open_files:
+    description: BPM open_files ulimit for the garage process.
+    default: 65536
+
+  smoke_tests.timeout_secs:
+    description: curl --max-time value in seconds for each smoke-test request.
+    default: 30

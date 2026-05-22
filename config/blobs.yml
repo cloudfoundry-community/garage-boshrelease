@@ -1,0 +1,6 @@
+---
+# Run `./scripts/fetch blobs` (or `make download-blobs`) to populate sha. It
+# will be set by `bosh add-blob`.
+garage/garage-linux-x86_64-musl-v1.3.1.bin:
+  size: 22314648
+  sha: sha256:PLACEHOLDER_RUN_FETCH_BLOBS

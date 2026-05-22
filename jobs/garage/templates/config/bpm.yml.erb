@@ -1,0 +1,24 @@
+---
+# Managed by BOSH. Do not edit manually.
+processes:
+- name: garage
+  executable: /var/vcap/packages/garage/bin/garage
+  args:
+  - server
+
+  env:
+    GARAGE_CONFIG_FILE: /var/vcap/jobs/garage/config/garage.toml
+    RUST_LOG: "<%= p('garage.log_level') %>"
+    RUST_BACKTRACE: "1"
+
+  limits:
+    open_files: <%= p('garage.bpm.open_files') %>
+
+  persistent_disk: true
+
+  additional_volumes:
+  - path: /var/vcap/data/garage
+    writable: true
+
+  hooks:
+    pre_start: /var/vcap/jobs/garage/bin/pre-start

@@ -1,0 +1,5 @@
+---
+name: garage
+dependencies: []
+files:
+  - garage/garage-linux-x86_64-musl-v*.bin

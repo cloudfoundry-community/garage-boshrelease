@@ -1,0 +1,42 @@
+<%
+  rpc_port    = p('garage.rpc_port')
+  s3_port     = p('garage.s3_port')
+  admin_port  = p('garage.admin_port')
+  repl_factor = p('garage.replication_factor').to_i
+-%>
+# Managed by BOSH. Do not edit manually.
+#
+# Garage configuration. See https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/
+
+metadata_dir = "<%= p('garage.metadata_dir') %>"
+data_dir     = "<%= p('garage.data_dir') %>"
+
+# lmdb is recommended for production; use sqlite for single-node dev/test environments.
+db_engine = "<%= p('garage.db_engine') %>"
+
+block_size         = <%= p('garage.block_size') %>
+replication_factor = <%= repl_factor %>
+consistency_mode   = "<%= p('garage.consistency_mode') %>"
+metadata_fsync     = <%= p('garage.metadata_fsync') %>
+compression_level  = <%= p('garage.compression_level') %>
+
+rpc_bind_addr   = "[::]:<%= rpc_port %>"
+rpc_public_addr = "<%= spec.ip %>:<%= rpc_port %>"
+rpc_secret_file = "/var/vcap/jobs/garage/config/rpc_secret"
+
+# Peer discovery uses `garage node connect` in post-start.erb rather than
+# a static peer list in this config file. Static peer lists require the
+# 64-char hex pubkey for each peer, which is generated on first start and
+# stored in metadata_dir — unknown at render time.
+
+[s3_api]
+api_bind_addr = "[::]:<%= s3_port %>"
+s3_region     = "<%= p('garage.s3_region') %>"
+<% if p('garage.s3_root_domain') != '' -%>
+root_domain   = "<%= p('garage.s3_root_domain') %>"
+<% end -%>
+
+[admin]
+api_bind_addr    = "127.0.0.1:<%= admin_port %>"
+admin_token_file = "/var/vcap/jobs/garage/config/admin_token"
+trace_sink       = ""

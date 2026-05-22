@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "Installing garage binary..."
+
+# Locate the single musl binary blob. The spec glob matches exactly one file.
+BIN=$(ls garage/garage-linux-x86_64-musl-v*.bin 2>/dev/null | head -n1)
+if [ -z "${BIN}" ]; then
+  echo "garage binary not found — check that the blob key matches the spec glob" >&2
+  exit 1
+fi
+
+mkdir -p "${BOSH_INSTALL_TARGET}/bin"
+cp "${BIN}" "${BOSH_INSTALL_TARGET}/bin/garage"
+chmod 0755 "${BOSH_INSTALL_TARGET}/bin/garage"
+
+# Verify the binary is executable and reports a version.
+"${BOSH_INSTALL_TARGET}/bin/garage" --version
+
+echo "garage installed successfully to ${BOSH_INSTALL_TARGET}/bin/garage"

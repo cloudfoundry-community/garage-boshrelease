@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+# Managed by BOSH. Do not edit manually.
+
+ADMIN_PORT="<%= p('garage.admin_port') %>"
+URL="http://127.0.0.1:${ADMIN_PORT}/health"
+
+echo "Waiting for Garage admin /health at ${URL}..."
+
+for i in $(seq 1 60); do
+  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${URL}" || echo "000")
+  if [ "${CODE}" = "200" ]; then
+    echo "Garage is healthy after ${i} attempts."
+    break
+  fi
+  sleep 2
+done
+
+if [ "${CODE}" != "200" ]; then
+  echo "Garage failed to report healthy within 120s. Last HTTP code: ${CODE}"
+  exit 1
+fi
+
+<% if spec.index > 0 -%>
+# Connect to the bootstrap leader (instance 0) so this node joins the gossip
+# ring. bootstrap_peers cannot be used in garage.toml because it requires the
+# 64-char hex pubkey, which is generated on first start and is unknown at
+# render time. `garage node connect` resolves this at runtime.
+
+GARAGE_BIN=/var/vcap/packages/garage/bin/garage
+export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
+export GARAGE_RPC_SECRET
+GARAGE_RPC_SECRET="$(cat /var/vcap/jobs/garage/config/rpc_secret)"
+
+LEADER_ADDR="<%= link('garage-rpc').instances[0].address %>"
+LEADER_PORT="<%= p('garage.rpc_port') %>"
+
+# Resolve hostname to IP (getent returns "<ip> <fqdn>"; fall back to the raw
+# address if getent is unavailable or returns nothing).
+LEADER_IP=$(getent hosts "${LEADER_ADDR}" 2>/dev/null | awk '{print $1; exit}')
+LEADER_IP="${LEADER_IP:-${LEADER_ADDR}}"
+
+echo "Querying leader node id at ${LEADER_IP}:${LEADER_PORT}..."
+
+# Point the CLI at the leader to retrieve its node id.
+export GARAGE_RPC_HOST="${LEADER_IP}:${LEADER_PORT}"
+
+LEADER_ID=""
+for i in $(seq 1 30); do
+  LEADER_ID=$("${GARAGE_BIN}" node id -q 2>/dev/null | awk -F@ '{print $1}')
+  if [ -n "${LEADER_ID}" ]; then
+    break
+  fi
+  sleep 2
+done
+
+if [ -z "${LEADER_ID}" ]; then
+  echo "WARNING: could not retrieve leader node id after 60s; manual 'garage node connect' may be needed."
+  # Non-fatal: post-deploy will assign layout roles once gossip forms organically.
+  exit 0
+fi
+
+# Reset RPC host to local node for the connect call (the connect target is
+# supplied as a CLI argument, not via the env var).
+unset GARAGE_RPC_HOST
+
+echo "Connecting to leader ${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}..."
+"${GARAGE_BIN}" node connect "${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}" \
+  || echo "WARNING: garage node connect returned non-zero (node may already be connected)."
+<% end -%>

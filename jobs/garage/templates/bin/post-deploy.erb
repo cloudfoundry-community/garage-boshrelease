@@ -1,0 +1,131 @@
+#!/bin/bash
+set -euo pipefail
+
+# Managed by BOSH. Do not edit manually.
+#
+# Idempotent cluster layout bootstrap. Runs on every deploy. No-op when:
+#   - garage.layout.manual is true (operator manages layout via mc addon), or
+#   - this is not the last instance index (highest index in the BOSH link), or
+#   - no nodes report "NO ROLE ASSIGNED" in `garage status`.
+#
+# Running on the LAST instance (not index 0) ensures that by the time this
+# hook executes, BOSH serial deployment has already brought up every earlier
+# instance through post-start, where `garage node connect` joins each node to
+# the gossip ring. The gossip ring is fully formed, so a single layout assign
+# covers all unassigned nodes in one pass.
+#
+# On first deploy this hook assigns a role (zone + capacity) to every fresh
+# node, then bumps the layout version. On subsequent deploys it short-circuits.
+
+INSTANCE_INDEX="<%= spec.index %>"
+EXPECTED_PEERS="<%= link('garage-rpc').instances.length %>"
+LAST_INDEX=$(( EXPECTED_PEERS - 1 ))
+MANUAL_LAYOUT="<%= p('garage.layout.manual') %>"
+ZONE="<%= spec.az %>"
+CAPACITY="<%= p('garage.layout.capacity') %>"
+
+GARAGE_BIN=/var/vcap/packages/garage/bin/garage
+export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
+export GARAGE_RPC_HOST="127.0.0.1:<%= p('garage.rpc_port') %>"
+
+# The RPC secret authenticates CLI commands to the cluster. Read from file
+# rather than embedding in the environment at render time, so that the secret
+# is never baked into the BOSH manifest or logged by the agent.
+export GARAGE_RPC_SECRET
+GARAGE_RPC_SECRET="$(cat /var/vcap/jobs/garage/config/rpc_secret)"
+
+log() { echo "[post-deploy] $*"; }
+
+# ── opt-out: operator manages layout manually ─────────────────────────────────
+if [ "${MANUAL_LAYOUT}" = "true" ]; then
+  log "garage.layout.manual=true — skipping auto-bootstrap. Use mc addon or CLI."
+  exit 0
+fi
+
+# ── only the last instance drives the cluster-wide operation ─────────────────
+# BOSH deploys instances serially (canaries=1). By the time the last instance
+# runs post-deploy, all earlier instances have completed post-start and called
+# `garage node connect`, so the gossip ring is fully formed.
+if [ "${INSTANCE_INDEX}" != "${LAST_INDEX}" ]; then
+  log "instance index ${INSTANCE_INDEX} is not the last (${LAST_INDEX}) — auto-bootstrap runs only on the last instance."
+  exit 0
+fi
+
+# ── wait until all expected peers are visible in garage status ────────────────
+# Even though every prior instance has finished post-start, gossip propagation
+# may take a few seconds. Poll until EXPECTED_PEERS nodes appear.
+log "waiting for ${EXPECTED_PEERS} peer(s) to appear in garage status..."
+VISIBLE=0
+for i in $(seq 1 30); do
+  VISIBLE=$("${GARAGE_BIN}" status 2>/dev/null | awk 'NR>1 && /^[a-f0-9]/' | wc -l | tr -d ' ')
+  if [ "${VISIBLE}" -ge "${EXPECTED_PEERS}" ]; then
+    log "all ${VISIBLE} peer(s) visible."
+    break
+  fi
+  log "  saw ${VISIBLE}/${EXPECTED_PEERS} after ${i} attempt(s), retrying..."
+  sleep 2
+done
+
+if [ "${VISIBLE}" -lt "${EXPECTED_PEERS}" ]; then
+  log "WARNING: only ${VISIBLE}/${EXPECTED_PEERS} peer(s) visible after 60s. Proceeding with what is reachable."
+fi
+
+# ── wait for the local node to be reachable via the RPC layer ─────────────────
+log "waiting up to 60s for local garage RPC..."
+for i in $(seq 1 30); do
+  if "${GARAGE_BIN}" status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+if ! "${GARAGE_BIN}" status >/dev/null 2>&1; then
+  log "FATAL: garage status failed after 60s; aborting bootstrap."
+  exit 1
+fi
+
+# ── capture full status output once ───────────────────────────────────────────
+STATUS_OUTPUT="$("${GARAGE_BIN}" status 2>&1)"
+echo "${STATUS_OUTPUT}"
+
+# ── extract unassigned node IDs ────────────────────────────────────────────────
+# Garage status output format (fresh node):
+#   ID                Hostname            Address               Tags  Zone  Capacity  DataAvail
+#   abcd1234ef567890  garage/0            10.0.0.1:3901         NO ROLE ASSIGNED
+#
+# We grab the first column only for lines that contain "NO ROLE ASSIGNED".
+UNASSIGNED_IDS=$(echo "${STATUS_OUTPUT}" \
+  | awk '/NO ROLE ASSIGNED/ { print $1 }' \
+  | sort -u)
+
+if [ -z "${UNASSIGNED_IDS}" ]; then
+  log "no unassigned nodes — cluster layout already established. No-op."
+  exit 0
+fi
+
+log "found unassigned nodes:"
+echo "${UNASSIGNED_IDS}"
+
+# ── assign each unassigned node ───────────────────────────────────────────────
+# Use the first 16 hex characters as the node prefix. Garage accepts any
+# unique prefix shorter than the full 64-char ID; 16 chars balances uniqueness
+# with brevity and matches the display width in `garage status` output.
+for FULL_ID in ${UNASSIGNED_IDS}; do
+  PREFIX="${FULL_ID:0:16}"
+  log "assigning role: id=${PREFIX} zone=${ZONE} capacity=${CAPACITY}"
+  "${GARAGE_BIN}" layout assign "${PREFIX}" -z "${ZONE}" -c "${CAPACITY}"
+done
+
+# ── apply layout with version + 1 ─────────────────────────────────────────────
+# `garage layout show` prints "Version: N" on its own line after the section
+# header. On a brand-new cluster the version may be absent or 0; default to 0
+# so the arithmetic never fails with an empty string.
+CURRENT_VERSION=$("${GARAGE_BIN}" layout show 2>&1 \
+  | grep -E "^Version:" \
+  | awk '{print $2}' \
+  | head -n1)
+NEXT_VERSION=$(( ${CURRENT_VERSION:-0} + 1 ))
+
+log "applying layout version ${NEXT_VERSION}..."
+"${GARAGE_BIN}" layout apply --version "${NEXT_VERSION}"
+
+log "bootstrap complete. New cluster layout version: ${NEXT_VERSION}."

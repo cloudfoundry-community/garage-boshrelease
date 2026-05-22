@@ -1,0 +1,42 @@
+#!/bin/bash
+# BOSH drain script for the garage job.
+#
+# Sends SIGTERM to the BPM-managed garage process and waits up to 60 seconds
+# for a clean exit. LMDB is susceptible to corruption after unclean shutdown,
+# so this script must complete before the persistent disk is detached.
+#
+# BOSH drain protocol: print the number of seconds remaining (0 = complete).
+# A non-zero exit code signals BOSH to retry the drain after that many seconds.
+set -eu
+
+PIDFILE=/var/vcap/sys/run/bpm/garage/garage.pid
+
+if [ -f "${PIDFILE}" ]; then
+  PID=$(cat "${PIDFILE}")
+  if kill -0 "${PID}" 2>/dev/null; then
+    echo "garage drain: sending SIGTERM to PID ${PID}"
+    kill -TERM "${PID}"
+
+    # Wait up to 60 seconds for the process to exit cleanly.
+    for i in $(seq 1 60); do
+      if ! kill -0 "${PID}" 2>/dev/null; then
+        echo "garage drain: process exited after ${i}s"
+        break
+      fi
+      sleep 1
+    done
+
+    # Final check — if still running after 60s, log and proceed.
+    # BOSH will escalate to SIGKILL if needed.
+    if kill -0 "${PID}" 2>/dev/null; then
+      echo "garage drain: process still running after 60s — BOSH will escalate" >&2
+    fi
+  else
+    echo "garage drain: PID ${PID} not running"
+  fi
+else
+  echo "garage drain: pidfile not found — process not running"
+fi
+
+# Signal drain complete. BOSH treats exit 0 + stdout "0" as drain complete.
+echo 0

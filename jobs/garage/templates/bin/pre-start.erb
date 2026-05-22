@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+# Managed by BOSH. Do not edit manually.
+
+META_DIR="<%= p('garage.metadata_dir') %>"
+DATA_DIR="<%= p('garage.data_dir') %>"
+EPHEMERAL_DIR="/var/vcap/data/garage"
+
+# Create persistent disk subdirectories.
+install -d -o vcap -g vcap -m 0750 "${META_DIR}"
+install -d -o vcap -g vcap -m 0750 "${DATA_DIR}"
+install -d -o vcap -g vcap -m 0750 "${EPHEMERAL_DIR}"
+
+# Write RPC shared secret to its own file (referenced by garage.toml via rpc_secret_file).
+RPC_SECRET_FILE=/var/vcap/jobs/garage/config/rpc_secret
+umask 077
+printf '%s' "<%= p('garage.rpc_secret') %>" > "${RPC_SECRET_FILE}"
+chown root:vcap "${RPC_SECRET_FILE}"
+chmod 0640 "${RPC_SECRET_FILE}"
+
+# Write admin API bearer token to its own file (referenced via admin_token_file).
+ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
+printf '%s' "<%= p('garage.admin_token') %>" > "${ADMIN_TOKEN_FILE}"
+chown root:vcap "${ADMIN_TOKEN_FILE}"
+chmod 0640 "${ADMIN_TOKEN_FILE}"
+
+echo "Garage pre-start: directories created, secrets staged."

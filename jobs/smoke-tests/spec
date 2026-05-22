@@ -1,0 +1,33 @@
+---
+name: smoke-tests
+
+description: |
+  S3 round-trip smoke tests for the Garage cluster. Run as a BOSH errand:
+    bosh -d <deployment> run-errand smoke-tests
+
+packages: []
+
+templates:
+  bin/run.erb: bin/run
+
+consumes:
+  - name: garage-rpc
+    type: garage-rpc
+
+properties:
+  garage.access_key:
+    description: S3 root access key. Same value the Garage admin uses for auth.
+  garage.secret_key:
+    description: S3 root secret key.
+  garage.s3_region:
+    description: S3 region label.
+    default: garage
+  garage.s3_port:
+    description: S3 API port on each Garage instance.
+    default: 3900
+  garage.admin_port:
+    description: Admin API port for health checks.
+    default: 3903
+  smoke_tests.timeout_secs:
+    description: curl --max-time per request.
+    default: 30

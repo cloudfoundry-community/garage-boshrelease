@@ -1,0 +1,131 @@
+#!/bin/bash
+set -euo pipefail
+
+# Managed by BOSH. Do not edit manually.
+
+ACCESS_KEY="<%= p('garage.access_key') %>"
+SECRET_KEY="<%= p('garage.secret_key') %>"
+REGION="<%= p('garage.s3_region') %>"
+S3_PORT="<%= p('garage.s3_port') %>"
+ADMIN_PORT="<%= p('garage.admin_port') %>"
+TIMEOUT="<%= p('smoke_tests.timeout_secs') %>"
+
+PEERS=(
+<% link('garage-rpc').instances.each do |i| -%>
+  "<%= i.address %>"
+<% end -%>
+)
+
+log() { echo "[smoke] $*"; }
+die() { echo "[smoke] FAIL: $*" >&2; exit 1; }
+
+# Phase 1: probe S3 API on every peer. Garage S3 returns an HTTP response
+# (typically 400 with InvalidRequest body) for an unauthenticated GET / —
+# what matters is TCP reachability and a parseable HTTP response.
+log "probing S3 reachability on ${#PEERS[@]} peer(s)..."
+for P in "${PEERS[@]}"; do
+  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+    --max-time "${TIMEOUT}" -X GET "http://${P}:${S3_PORT}/" || echo "000")
+  if [ "${CODE}" = "000" ]; then
+    die "peer ${P} S3 port ${S3_PORT} unreachable"
+  fi
+  log "  ${P}:${S3_PORT}/ = ${CODE} (S3 endpoint reachable)"
+done
+
+# Phase 2: S3 round trip against the first peer.
+TARGET="${PEERS[0]}"
+ENDPOINT="http://${TARGET}:${S3_PORT}"
+BUCKET="smoke-$(date +%s)-$$"
+KEY="testobject"
+PAYLOAD="hello-from-garage-smoke-$(date +%s)"
+
+log "S3 round trip against ${ENDPOINT}, bucket=${BUCKET}"
+
+# AWS Signature V4 helpers (HMAC chain).
+sha256_hex() { printf '%s' "$1" | openssl dgst -sha256 -hex | awk '{print $2}'; }
+
+aws_sigv4() {
+  # Args: method canonical_uri payload_hash query content_type
+  local METHOD="$1" CANONICAL_URI="$2" PAYLOAD_HASH="$3" QUERY="$4" CONTENT_TYPE="$5"
+  local DATE_STAMP AMZ_DATE
+  DATE_STAMP=$(date -u +%Y%m%d)
+  AMZ_DATE=$(date -u +%Y%m%dT%H%M%SZ)
+  local HOST="${TARGET}:${S3_PORT}"
+  local SERVICE=s3
+
+  local CANONICAL_HEADERS="content-type:${CONTENT_TYPE}\nhost:${HOST}\nx-amz-content-sha256:${PAYLOAD_HASH}\nx-amz-date:${AMZ_DATE}\n"
+  local SIGNED_HEADERS="content-type;host;x-amz-content-sha256;x-amz-date"
+  local CANONICAL_REQ="${METHOD}\n${CANONICAL_URI}\n${QUERY}\n${CANONICAL_HEADERS}\n${SIGNED_HEADERS}\n${PAYLOAD_HASH}"
+  local CANONICAL_HASH
+  CANONICAL_HASH=$(printf '%b' "${CANONICAL_REQ}" | openssl dgst -sha256 -hex | awk '{print $2}')
+
+  local CREDENTIAL_SCOPE="${DATE_STAMP}/${REGION}/${SERVICE}/aws4_request"
+  local STRING_TO_SIGN="AWS4-HMAC-SHA256\n${AMZ_DATE}\n${CREDENTIAL_SCOPE}\n${CANONICAL_HASH}"
+
+  local DATE_KEY REGION_KEY SERVICE_KEY SIGNING_KEY SIGNATURE
+  DATE_KEY=$(printf '%s' "${DATE_STAMP}" | openssl dgst -sha256 -mac HMAC -macopt "key:AWS4${SECRET_KEY}" -hex | awk '{print $2}')
+  REGION_KEY=$(printf '%s' "${REGION}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${DATE_KEY}" -hex | awk '{print $2}')
+  SERVICE_KEY=$(printf '%s' "${SERVICE}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${REGION_KEY}" -hex | awk '{print $2}')
+  SIGNING_KEY=$(printf '%s' "aws4_request" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${SERVICE_KEY}" -hex | awk '{print $2}')
+  SIGNATURE=$(printf '%b' "${STRING_TO_SIGN}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${SIGNING_KEY}" -hex | awk '{print $2}')
+
+  echo "Authorization: AWS4-HMAC-SHA256 Credential=${ACCESS_KEY}/${CREDENTIAL_SCOPE}, SignedHeaders=${SIGNED_HEADERS}, Signature=${SIGNATURE}"
+  echo "x-amz-content-sha256: ${PAYLOAD_HASH}"
+  echo "x-amz-date: ${AMZ_DATE}"
+  echo "host: ${HOST}"
+  echo "content-type: ${CONTENT_TYPE}"
+}
+
+EMPTY_HASH=$(sha256_hex "")
+PAYLOAD_HASH=$(sha256_hex "${PAYLOAD}")
+
+# CreateBucket (PUT /<bucket>)
+log "CreateBucket"
+mapfile -t HDR < <(aws_sigv4 PUT "/${BUCKET}" "${EMPTY_HASH}" "" "application/xml")
+CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --max-time "${TIMEOUT}")
+[ "${CODE}" = "200" ] || die "CreateBucket got ${CODE}: $(cat /tmp/smoke-out)"
+
+# PutObject
+log "PutObject"
+mapfile -t HDR < <(aws_sigv4 PUT "/${BUCKET}/${KEY}" "${PAYLOAD_HASH}" "" "text/plain")
+CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}/${KEY}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --data-binary "${PAYLOAD}" --max-time "${TIMEOUT}")
+[ "${CODE}" = "200" ] || die "PutObject got ${CODE}: $(cat /tmp/smoke-out)"
+
+# GetObject + verify content
+log "GetObject"
+mapfile -t HDR < <(aws_sigv4 GET "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/octet-stream")
+BODY=$(curl -sS -X GET "${ENDPOINT}/${BUCKET}/${KEY}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --max-time "${TIMEOUT}")
+[ "${BODY}" = "${PAYLOAD}" ] || die "GetObject body mismatch: got '${BODY}' expected '${PAYLOAD}'"
+
+# DeleteObject
+log "DeleteObject"
+mapfile -t HDR < <(aws_sigv4 DELETE "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/xml")
+CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}/${KEY}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --max-time "${TIMEOUT}")
+[ "${CODE}" = "204" ] || die "DeleteObject got ${CODE}: $(cat /tmp/smoke-out)"
+
+# HeadObject — expect 404 after deletion
+log "HeadObject (expect 404)"
+mapfile -t HDR < <(aws_sigv4 HEAD "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/xml")
+CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X HEAD "${ENDPOINT}/${BUCKET}/${KEY}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --max-time "${TIMEOUT}")
+[ "${CODE}" = "404" ] || die "HeadObject after delete got ${CODE} (expected 404)"
+
+# DeleteBucket
+log "DeleteBucket"
+mapfile -t HDR < <(aws_sigv4 DELETE "/${BUCKET}" "${EMPTY_HASH}" "" "application/xml")
+CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}" \
+  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
+  --max-time "${TIMEOUT}")
+[ "${CODE}" = "204" ] || die "DeleteBucket got ${CODE}: $(cat /tmp/smoke-out)"
+
+log "all smoke tests PASSED"
+exit 0

@@ -1,0 +1,5 @@
+check process garage
+  with pidfile /var/vcap/sys/run/bpm/garage/garage.pid
+  start program "/var/vcap/jobs/bpm/bin/bpm start garage"
+  stop program "/var/vcap/jobs/bpm/bin/bpm stop garage"
+  group vcap
