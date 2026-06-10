@@ -17,7 +17,7 @@ RPC_SECRET_FILE=/var/vcap/jobs/garage/config/rpc_secret
 umask 077
 printf '%s' "<%= p('garage.rpc_secret') %>" > "${RPC_SECRET_FILE}"
 chown root:vcap "${RPC_SECRET_FILE}"
-chmod 0640 "${RPC_SECRET_FILE}"
+chmod 0600 "${RPC_SECRET_FILE}"
 
 # Write admin API bearer token to its own file (referenced via admin_token_file).
 ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
