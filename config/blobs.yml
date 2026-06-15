@@ -1,4 +1,3 @@
-garage/garage-linux-x86_64-musl-v1.3.1.bin:
-  size: 22314648
-  object_id: 3e31c3e9-2080-4394-54c2-e12182953314
-  sha: sha256:0441419f7c0b372d37e533a80e08367023d30fa56a56d1db3f8a2aff27e24c92
+garage/garage-linux-x86_64-musl-v2.3.0.bin:
+  size: 71281456
+  sha: sha256:f98d317942bb341151a2775162016bb50cf86b865d0108de03eb5db16e2120cd

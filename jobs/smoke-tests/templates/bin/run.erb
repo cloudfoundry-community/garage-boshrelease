@@ -9,6 +9,7 @@ REGION="<%= p('garage.s3_region') %>"
 S3_PORT="<%= p('garage.s3_port') %>"
 ADMIN_PORT="<%= p('garage.admin_port') %>"
 TIMEOUT="<%= p('smoke_tests.timeout_secs') %>"
+BUCKET="<%= p('garage.default_bucket') %>"
 
 PEERS=(
 <% link('garage-rpc').instances.each do |i| -%>
@@ -32,14 +33,15 @@ for P in "${PEERS[@]}"; do
   log "  ${P}:${S3_PORT}/ = ${CODE} (S3 endpoint reachable)"
 done
 
-# Phase 2: S3 round trip against the first peer.
+# Phase 2: S3 round trip against the first peer, operating within the
+# auto-provisioned default bucket. No CreateBucket or DeleteBucket — the
+# bucket is created by Garage on first start via GARAGE_DEFAULT_BUCKET.
 TARGET="${PEERS[0]}"
 ENDPOINT="http://${TARGET}:${S3_PORT}"
-BUCKET="smoke-$(date +%s)-$$"
-KEY="testobject"
+KEY="smoke-$(date +%s)-$$"
 PAYLOAD="hello-from-garage-smoke-$(date +%s)"
 
-log "S3 round trip against ${ENDPOINT}, bucket=${BUCKET}"
+log "S3 round trip against ${ENDPOINT}, bucket=${BUCKET}, key=${KEY}"
 
 # AWS Signature V4 helpers (HMAC chain).
 sha256_hex() { printf '%s' "$1" | openssl dgst -sha256 -hex | awk '{print $2}'; }
@@ -79,16 +81,8 @@ aws_sigv4() {
 EMPTY_HASH=$(sha256_hex "")
 PAYLOAD_HASH=$(sha256_hex "${PAYLOAD}")
 
-# CreateBucket (PUT /<bucket>)
-log "CreateBucket"
-mapfile -t HDR < <(aws_sigv4 PUT "/${BUCKET}" "${EMPTY_HASH}" "" "application/xml")
-CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}" \
-  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
-  --max-time "${TIMEOUT}")
-[ "${CODE}" = "200" ] || die "CreateBucket got ${CODE}: $(cat /tmp/smoke-out)"
-
 # PutObject
-log "PutObject"
+log "PutObject /${BUCKET}/${KEY}"
 mapfile -t HDR < <(aws_sigv4 PUT "/${BUCKET}/${KEY}" "${PAYLOAD_HASH}" "" "text/plain")
 CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
@@ -96,7 +90,7 @@ CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET
 [ "${CODE}" = "200" ] || die "PutObject got ${CODE}: $(cat /tmp/smoke-out)"
 
 # GetObject + verify content
-log "GetObject"
+log "GetObject /${BUCKET}/${KEY}"
 mapfile -t HDR < <(aws_sigv4 GET "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/octet-stream")
 BODY=$(curl -sS -X GET "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
@@ -104,28 +98,24 @@ BODY=$(curl -sS -X GET "${ENDPOINT}/${BUCKET}/${KEY}" \
 [ "${BODY}" = "${PAYLOAD}" ] || die "GetObject body mismatch: got '${BODY}' expected '${PAYLOAD}'"
 
 # DeleteObject
-log "DeleteObject"
+log "DeleteObject /${BUCKET}/${KEY}"
 mapfile -t HDR < <(aws_sigv4 DELETE "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/xml")
 CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
   --max-time "${TIMEOUT}")
 [ "${CODE}" = "204" ] || die "DeleteObject got ${CODE}: $(cat /tmp/smoke-out)"
 
-# HeadObject — expect 404 after deletion
-log "HeadObject (expect 404)"
+# HeadObject — expect 404 after deletion.
+# Use curl --head, NOT `-X HEAD`. With `-X HEAD` curl issues a HEAD request but
+# still waits for a response body (per the overridden method), and since HEAD
+# responses carry no body curl blocks until --max-time elapses. --head tells
+# curl the response is header-only, so it returns as soon as headers arrive.
+log "HeadObject /${BUCKET}/${KEY} (expect 404)"
 mapfile -t HDR < <(aws_sigv4 HEAD "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/xml")
-CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X HEAD "${ENDPOINT}/${BUCKET}/${KEY}" \
+CODE=$(curl -sS -o /dev/null -w "%{http_code}" --head "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
   --max-time "${TIMEOUT}")
 [ "${CODE}" = "404" ] || die "HeadObject after delete got ${CODE} (expected 404)"
-
-# DeleteBucket
-log "DeleteBucket"
-mapfile -t HDR < <(aws_sigv4 DELETE "/${BUCKET}" "${EMPTY_HASH}" "" "application/xml")
-CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}" \
-  -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
-  --max-time "${TIMEOUT}")
-[ "${CODE}" = "204" ] || die "DeleteBucket got ${CODE}: $(cat /tmp/smoke-out)"
 
 log "all smoke tests PASSED"
 exit 0

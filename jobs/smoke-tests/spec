@@ -16,9 +16,14 @@ consumes:
 
 properties:
   garage.access_key:
-    description: S3 root access key. Same value the Garage admin uses for auth.
+    description: S3 root access key id (e.g. GK + 32 hex chars). Same value wired as GARAGE_DEFAULT_ACCESS_KEY in bpm.
   garage.secret_key:
-    description: S3 root secret key.
+    description: S3 root secret key (64 hex chars). Same value wired as GARAGE_DEFAULT_SECRET_KEY in bpm.
+  garage.default_bucket:
+    description: |
+      Name of the auto-provisioned default bucket. Must match the value set in
+      the garage job's garage.default_bucket property.
+    default: garage
   garage.s3_region:
     description: S3 region label.
     default: garage

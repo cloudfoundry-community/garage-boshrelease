@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_VERSION = "1.3.1"
+DEFAULT_VERSION = "2.3.0"
 CDN_BASE = "https://garagehq.deuxfleurs.fr/_releases"
 SUPPORTED_ARCHES = ("x86_64", "aarch64")
 CHUNK = 1 << 20  # 1 MiB

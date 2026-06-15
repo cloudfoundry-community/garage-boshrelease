@@ -5,9 +5,16 @@ processes:
   executable: /var/vcap/packages/garage/bin/garage
   args:
   - server
+<% if link('garage-rpc').instances.length == 1 -%>
+  - --single-node
+<% end -%>
+  - --default-bucket
 
   env:
     GARAGE_CONFIG_FILE: /var/vcap/jobs/garage/config/garage.toml
+    GARAGE_DEFAULT_ACCESS_KEY: "<%= p('garage.access_key') %>"
+    GARAGE_DEFAULT_SECRET_KEY: "<%= p('garage.secret_key') %>"
+    GARAGE_DEFAULT_BUCKET: "<%= p('garage.default_bucket') %>"
     RUST_LOG: "<%= p('garage.log_level') %>"
     RUST_BACKTRACE: "1"
 
@@ -15,10 +22,6 @@ processes:
     open_files: <%= p('garage.bpm.open_files') %>
 
   persistent_disk: true
-
-  additional_volumes:
-  - path: /var/vcap/data/garage
-    writable: true
 
   hooks:
     pre_start: /var/vcap/jobs/garage/bin/pre-start

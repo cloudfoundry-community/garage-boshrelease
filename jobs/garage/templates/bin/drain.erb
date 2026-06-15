@@ -5,8 +5,9 @@
 # for a clean exit. LMDB is susceptible to corruption after unclean shutdown,
 # so this script must complete before the persistent disk is detached.
 #
-# BOSH drain protocol: print the number of seconds remaining (0 = complete).
-# A non-zero exit code signals BOSH to retry the drain after that many seconds.
+# BOSH drain protocol: stdout must be a single integer — the seconds remaining
+# (0 = complete). All human-readable diagnostics MUST go to stderr; any
+# non-integer text on stdout fails the drain. A non-zero exit also fails it.
 set -eu
 
 PIDFILE=/var/vcap/sys/run/bpm/garage/garage.pid
@@ -14,13 +15,13 @@ PIDFILE=/var/vcap/sys/run/bpm/garage/garage.pid
 if [ -f "${PIDFILE}" ]; then
   PID=$(cat "${PIDFILE}")
   if kill -0 "${PID}" 2>/dev/null; then
-    echo "garage drain: sending SIGTERM to PID ${PID}"
+    echo "garage drain: sending SIGTERM to PID ${PID}" >&2
     kill -TERM "${PID}"
 
     # Wait up to 60 seconds for the process to exit cleanly.
     for i in $(seq 1 60); do
       if ! kill -0 "${PID}" 2>/dev/null; then
-        echo "garage drain: process exited after ${i}s"
+        echo "garage drain: process exited after ${i}s" >&2
         break
       fi
       sleep 1
@@ -32,10 +33,10 @@ if [ -f "${PIDFILE}" ]; then
       echo "garage drain: process still running after 60s — BOSH will escalate" >&2
     fi
   else
-    echo "garage drain: PID ${PID} not running"
+    echo "garage drain: PID ${PID} not running" >&2
   fi
 else
-  echo "garage drain: pidfile not found — process not running"
+  echo "garage drain: pidfile not found — process not running" >&2
 fi
 
 # Signal drain complete. BOSH treats exit 0 + stdout "0" as drain complete.

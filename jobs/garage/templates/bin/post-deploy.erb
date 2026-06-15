@@ -26,7 +26,12 @@ CAPACITY="<%= p('garage.layout.capacity') %>"
 
 GARAGE_BIN=/var/vcap/packages/garage/bin/garage
 export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
-export GARAGE_RPC_HOST="127.0.0.1:<%= p('garage.rpc_port') %>"
+
+# Do NOT set GARAGE_RPC_HOST for local CLI calls. In garage v2.x the variable
+# must be a full "<node-id>@<ip>:<port>" identifier; a bare "host:port" is
+# rejected with "Invalid RPC remote node identifier". With the variable unset,
+# the CLI connects to the local node using rpc_bind_addr from the config file,
+# which is exactly what every command in this hook needs.
 
 # The RPC secret authenticates CLI commands to the cluster. Read from file
 # rather than embedding in the environment at render time, so that the secret
@@ -57,7 +62,10 @@ fi
 log "waiting for ${EXPECTED_PEERS} peer(s) to appear in garage status..."
 VISIBLE=0
 for i in $(seq 1 30); do
-  VISIBLE=$("${GARAGE_BIN}" status 2>/dev/null | awk 'NR>1 && /^[a-f0-9]/' | wc -l | tr -d ' ')
+  # `|| true` keeps a transient non-zero `garage status` (RPC not yet ready)
+  # from tripping `set -e`; the loop retries until peers appear.
+  VISIBLE=$("${GARAGE_BIN}" status 2>/dev/null | awk 'NR>1 && /^[a-f0-9]/' | wc -l | tr -d ' ' || true)
+  VISIBLE=${VISIBLE:-0}
   if [ "${VISIBLE}" -ge "${EXPECTED_PEERS}" ]; then
     log "all ${VISIBLE} peer(s) visible."
     break

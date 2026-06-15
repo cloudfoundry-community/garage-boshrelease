@@ -139,6 +139,23 @@ properties:
       Supports T, G, M suffixes (e.g., 1T, 500G).
     default: 1T
 
+  garage.access_key:
+    description: |
+      S3 root access key id (e.g. GK + 32 hex chars). Also exported as
+      GARAGE_DEFAULT_ACCESS_KEY so Garage auto-provisions the root key on
+      first start (requires --default-bucket / --single-node flags).
+
+  garage.secret_key:
+    description: |
+      S3 root secret key (64 hex chars). Also exported as
+      GARAGE_DEFAULT_SECRET_KEY for auto-provisioning.
+
+  garage.default_bucket:
+    description: |
+      Name of the bucket Garage auto-provisions on first start when
+      GARAGE_DEFAULT_BUCKET is set. Also used by the smoke-tests errand.
+    default: garage
+
   garage.bpm.open_files:
     description: BPM open_files ulimit for the garage process.
     default: 65536

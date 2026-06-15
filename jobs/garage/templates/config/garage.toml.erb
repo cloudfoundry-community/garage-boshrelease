@@ -39,4 +39,7 @@ root_domain   = "<%= p('garage.s3_root_domain') %>"
 [admin]
 api_bind_addr    = "127.0.0.1:<%= admin_port %>"
 admin_token_file = "/var/vcap/jobs/garage/config/admin_token"
-trace_sink       = ""
+# trace_sink is intentionally omitted: it expects an OpenTelemetry OTLP
+# endpoint URL (e.g. "http://localhost:4317"). An empty string is treated
+# as a misconfigured exporter and aborts garage during tracing init. Add it
+# back only when an OTLP collector endpoint is available.

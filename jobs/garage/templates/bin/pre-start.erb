@@ -12,17 +12,21 @@ install -d -o vcap -g vcap -m 0750 "${META_DIR}"
 install -d -o vcap -g vcap -m 0750 "${DATA_DIR}"
 install -d -o vcap -g vcap -m 0750 "${EPHEMERAL_DIR}"
 
-# Write RPC shared secret to its own file (referenced by garage.toml via rpc_secret_file).
+# Write RPC shared secret to its own file (referenced by garage.toml via
+# rpc_secret_file). Garage refuses to start unless this file is mode 0600
+# (not group- or world-readable), so it is owned by the runtime user (vcap)
+# and readable only by that owner.
 RPC_SECRET_FILE=/var/vcap/jobs/garage/config/rpc_secret
 umask 077
 printf '%s' "<%= p('garage.rpc_secret') %>" > "${RPC_SECRET_FILE}"
-chown root:vcap "${RPC_SECRET_FILE}"
-chmod 0640 "${RPC_SECRET_FILE}"
+chown vcap:vcap "${RPC_SECRET_FILE}"
+chmod 0600 "${RPC_SECRET_FILE}"
 
 # Write admin API bearer token to its own file (referenced via admin_token_file).
+# Same 0600 / vcap-owned requirement as the RPC secret.
 ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
 printf '%s' "<%= p('garage.admin_token') %>" > "${ADMIN_TOKEN_FILE}"
-chown root:vcap "${ADMIN_TOKEN_FILE}"
-chmod 0640 "${ADMIN_TOKEN_FILE}"
+chown vcap:vcap "${ADMIN_TOKEN_FILE}"
+chmod 0600 "${ADMIN_TOKEN_FILE}"
 
 echo "Garage pre-start: directories created, secrets staged."
