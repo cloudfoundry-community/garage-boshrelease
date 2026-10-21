@@ -1,0 +1,135 @@
+# Managed by BOSH. Do not edit manually.
+#
+# Shared shell helpers for the garage job's lifecycle scripts. The scripts
+# source this file; it is not meant to be executed on its own.
+<%
+  peers      = link('garage-rpc').instances
+  admin_bind = p('garage.admin_bind_address').to_s
+  if admin_bind.empty?
+    admin_bind = peers.length == 1 ? '127.0.0.1' : spec.ip
+  end
+  # A wildcard bind is reached locally through loopback.
+  local_admin = case admin_bind
+                when '0.0.0.0' then '127.0.0.1'
+                when '::'      then '::1'
+                else admin_bind
+                end
+  local_admin = "[#{local_admin}]" if local_admin.include?(':')
+-%>
+
+GARAGE_BIN=/var/vcap/packages/garage/bin/garage
+GARAGE_JOB_DIR=/var/vcap/jobs/garage
+export GARAGE_CONFIG_FILE="${GARAGE_JOB_DIR}/config/garage.toml"
+
+RPC_SECRET_FILE="${GARAGE_JOB_DIR}/config/rpc_secret"
+ADMIN_TOKEN_FILE="${GARAGE_JOB_DIR}/config/admin_token"
+# "Authorization: Bearer <token>", read by curl with -H @file so the token
+# never appears on a command line.
+ADMIN_AUTH_HEADER_FILE="${GARAGE_JOB_DIR}/config/admin_auth_header"
+S3_SECRET_KEY_FILE="${GARAGE_JOB_DIR}/config/s3_secret_key"
+
+# Records the replication factor the node's cluster was built with.
+GARAGE_STORE_DIR=/var/vcap/store/garage
+RF_MARKER_FILE="${GARAGE_STORE_DIR}/replication_factor"
+
+ADMIN_PORT="<%= p('garage.admin_port') %>"
+RPC_PORT="<%= p('garage.rpc_port') %>"
+LOCAL_ADMIN_URL="http://<%= local_admin %>:${ADMIN_PORT}"
+
+# Exports the RPC secret that authenticates CLI calls to the local node. It
+# is read from the staged file rather than rendered into a script.
+load_rpc_secret() {
+  GARAGE_RPC_SECRET="$(< "${RPC_SECRET_FILE}")"
+  export GARAGE_RPC_SECRET
+}
+
+# Prints an IPv4 address for a link address. A literal IPv4 or IPv6 address
+# is printed unchanged, and a DNS name is resolved with `getent ahostsv4`.
+# Returns non-zero when a name does not resolve.
+resolve_ipv4() {
+  local addr="$1" ip
+  case "${addr}" in
+    *:*) echo "${addr}"; return 0 ;;
+  esac
+  if [[ "${addr}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "${addr}"
+    return 0
+  fi
+  ip=$(getent ahostsv4 "${addr}" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+  [ -n "${ip}" ] || return 1
+  echo "${ip}"
+}
+
+# Joins a host and a port, and brackets an IPv6 host.
+host_port() {
+  case "$1" in
+    *:*) echo "[$1]:$2" ;;
+    *)   echo "$1:$2" ;;
+  esac
+}
+
+# Strips the port, and any IPv6 brackets, from a "host:port" address.
+strip_port() {
+  local a="${1%:*}"
+  a="${a#[}"
+  echo "${a%]}"
+}
+
+# Prints the cluster layout version this node knows about. A node with no
+# layout yet prints 0. A failed CLI call, or output without a version line,
+# returns non-zero, so an error never reads as a brand new cluster.
+layout_version() {
+  local out v
+  if ! out=$("${GARAGE_BIN}" layout show 2>&1); then
+    echo "garage layout show failed: ${out}" >&2
+    return 1
+  fi
+  v=$(awk -F': *' '/^Current cluster layout version:/ { print $2; exit }' <<< "${out}")
+  if ! [[ "${v}" =~ ^[0-9]+$ ]]; then
+    echo "garage layout show printed no layout version" >&2
+    return 1
+  fi
+  echo "${v}"
+}
+
+# Same as layout_version, but retries for up to 30 seconds while the local
+# RPC layer comes up. Only the last failure is reported.
+layout_version_retry() {
+  local i
+  for i in $(seq 1 14); do
+    layout_version 2>/dev/null && return 0
+    sleep 2
+  done
+  layout_version
+}
+
+# Runs curl against an admin API with the bearer token from the header file.
+admin_curl() {
+  curl --silent --fail --max-time 5 -H @"${ADMIN_AUTH_HEADER_FILE}" "$@"
+}
+
+# Prints the node id that the admin API at the given host:port reports for
+# itself, or nothing when the API cannot be reached.
+remote_node_id() {
+  admin_curl --connect-timeout 3 "http://$1/v2/GetNodeInfo?node=self" 2>/dev/null \
+    | grep -o '"nodeId": *"[0-9a-f]\{64\}"' | grep -o '[0-9a-f]\{64\}' | head -n1 || true
+}
+
+# The functions below read `garage status` or `garage layout show` output on
+# stdin and print the table rows of one section. Garage prints 16-character
+# node id prefixes in the first column.
+section_rows() {
+  awk -v want="$1" '
+    /^==== .* ====$/ { s = ($0 == want); next }
+    s && length($1) == 16 && $1 ~ /^[0-9a-f]+$/ { print }
+  '
+}
+healthy_rows()        { section_rows '==== HEALTHY NODES ===='; }
+failed_rows()         { section_rows '==== FAILED NODES ===='; }
+current_layout_rows() { section_rows '==== CURRENT CLUSTER LAYOUT ===='; }
+
+# Succeeds when `garage layout show` output (on stdin) has staged changes
+# that nobody has applied yet.
+has_staged_changes() {
+  grep -q -e '^==== STAGED ROLE CHANGES ====' -e 'To enact the staged role changes'
+}

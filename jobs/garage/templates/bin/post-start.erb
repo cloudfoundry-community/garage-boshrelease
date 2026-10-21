@@ -2,108 +2,184 @@
 set -euo pipefail
 
 # Managed by BOSH. Do not edit manually.
+#
+# Waits for the local Garage node, joins it to its peers, and waits for it
+# to report healthy.
+#
+# The join target is the instance with the lowest index in the garage-rpc
+# link. Every other instance connects to it, and the join target tries to
+# connect to every other instance, so a join target that comes back with a
+# wiped disk finds the cluster again. bootstrap_peers cannot be rendered
+# into garage.toml because a peer is named by its node id, which is
+# generated on first start, so each id is read from that instance's admin
+# API (GetNodeInfo) with the shared admin token.
 <%
-  peers      = link('garage-rpc').instances
-  admin_bind = p('garage.admin_bind_address').to_s
-  if admin_bind.empty?
-    admin_bind = peers.length == 1 ? '127.0.0.1' : spec.ip
-  end
-  local_admin = admin_bind == '0.0.0.0' ? '127.0.0.1' : admin_bind
+  peers = link('garage-rpc').instances
+  join  = peers.min_by { |i| i.index }
 -%>
 
-ADMIN_PORT="<%= p('garage.admin_port') %>"
-URL="http://<%= local_admin %>:${ADMIN_PORT}/health"
+source /var/vcap/jobs/garage/bin/helpers.sh
+load_rpc_secret
 
-GARAGE_BIN=/var/vcap/packages/garage/bin/garage
-export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
-export GARAGE_RPC_SECRET
-GARAGE_RPC_SECRET="$(cat /var/vcap/jobs/garage/config/rpc_secret)"
+SELF_INDEX="<%= spec.index %>"
+JOIN_INDEX="<%= join.index %>"
+JOIN_ADDR="<%= join.address %>"
+RENDERED_RF="<%= p('garage.replication_factor').to_i %>"
 
-# Prints the cluster layout version this node knows about, or 0 when it has
-# none yet. Garage v2 prints "Current cluster layout version: N".
-layout_version() {
-  local v
-  v=$("${GARAGE_BIN}" layout show 2>/dev/null \
-    | awk -F': *' '/^Current cluster layout version:/ { print $2; exit }' || true)
-  echo "${v:-0}"
-}
+# "index address" of every other instance in the link.
+OTHER_PEERS="$(cat <<'PEERS'
+<% peers.each do |i| next if i.index == spec.index -%>
+<%= i.index %> <%= i.address %>
+<% end -%>
+PEERS
+)"
 
-echo "Waiting for Garage admin /health at ${URL}..."
+log() { echo "[post-start] $*"; }
 
-# /health answers 200 once the node can serve reads and writes. A node that
-# belongs to no applied layout yet (the first deploy of a cluster, or a node
-# being added to one) answers 503 until the post-deploy hook assigns roles,
-# so a 503 from a node whose layout version is still 0 counts as started.
+# ── wait for the local admin API ─────────────────────────────────────────────
+log "waiting for the Garage admin API at ${LOCAL_ADMIN_URL}..."
 CODE=000
-FRESH=false
 for i in $(seq 1 60); do
-  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${URL}" || true)
-  if [ "${CODE}" = "200" ]; then
-    echo "Garage is healthy after ${i} attempts."
-    break
-  fi
-  if [ "${CODE}" = "503" ] && [ "$(layout_version)" = "0" ]; then
-    FRESH=true
-    echo "Garage is running and has no cluster layout yet; post-deploy will assign one."
-    break
-  fi
+  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${LOCAL_ADMIN_URL}/health" || true)
+  [ "${CODE}" != "000" ] && break
   sleep 2
 done
-
-if [ "${CODE}" != "200" ] && [ "${FRESH}" != "true" ]; then
-  echo "Garage failed to report healthy within 120s. Last HTTP code: ${CODE}"
+if [ "${CODE}" = "000" ]; then
+  log "FATAL: the Garage admin API at ${LOCAL_ADMIN_URL} did not answer within 120s."
   exit 1
 fi
 
-<% if spec.index > 0 -%>
-# Join the gossip ring through the first instance. bootstrap_peers cannot be
-# rendered into garage.toml because a peer is named by its node id, which is
-# generated on first start. The Garage v2 CLI also cannot ask a remote node
-# for its id over RPC, so this reads the id from the first instance's admin
-# API (GetNodeInfo) with the shared admin token and then runs
-# `garage node connect`.
+# ── read the layout version ──────────────────────────────────────────────────
+# A node with no layout yet (version 0) is fresh: the first deploy of a
+# cluster, a node being added, or a node whose disk was wiped. A failed CLI
+# call is fatal, because guessing 0 would change which failures count.
+if ! VERSION=$(layout_version_retry); then
+  log "FATAL: could not read the cluster layout version from the local node."
+  exit 1
+fi
+FRESH=false
+[ "${VERSION}" = "0" ] && FRESH=true
+log "local layout version is ${VERSION} (fresh=${FRESH})."
 
-LEADER_ADDR="<%= peers[0].address %>"
-LEADER_PORT="<%= p('garage.rpc_port') %>"
+# ── join the cluster ─────────────────────────────────────────────────────────
+# Connects to the instance with the given index and address. Returns
+# non-zero when the address does not resolve, the instance's admin API does
+# not answer, or `garage node connect` fails.
+connect_peer() {
+  local idx="$1" addr="$2" ip id out
+  if ! ip=$(resolve_ipv4 "${addr}"); then
+    log "WARNING: the address ${addr} of instance ${idx} does not resolve to an IPv4 address."
+    return 1
+  fi
+  id=$(remote_node_id "$(host_port "${ip}" "${ADMIN_PORT}")")
+  [ -n "${id}" ] || return 1
+  if ! out=$("${GARAGE_BIN}" node connect "${id}@$(host_port "${ip}" "${RPC_PORT}")" 2>&1); then
+    log "garage node connect to instance ${idx} failed: ${out}"
+    return 1
+  fi
+  log "connected to instance ${idx} (${id:0:16} at ${ip})."
+}
 
-# Resolve hostname to IP (getent returns "<ip> <fqdn>"; fall back to the raw
-# address if getent is unavailable or returns nothing).
-LEADER_IP=$(getent hosts "${LEADER_ADDR}" 2>/dev/null | awk '{print $1; exit}' || true)
-LEADER_IP="${LEADER_IP:-${LEADER_ADDR}}"
+if [ -z "${OTHER_PEERS}" ]; then
+  log "this is the only instance in the garage-rpc link; nothing to join."
+elif [ "${SELF_INDEX}" = "${JOIN_INDEX}" ]; then
+  # On the first deploy the other instances do not exist yet, so a failure
+  # here is expected and never fatal. Each peer gets one quick attempt.
+  CONNECTED=0
+  while read -r IDX ADDR; do
+    [ -n "${IDX}" ] || continue
+    if connect_peer "${IDX}" "${ADDR}"; then
+      CONNECTED=$((CONNECTED + 1))
+    else
+      log "instance ${IDX} is not reachable yet; it connects to this node when it starts."
+    fi
+  done <<< "${OTHER_PEERS}"
+  log "join target connected to ${CONNECTED} other instance(s)."
+else
+  log "joining the cluster through instance ${JOIN_INDEX} at ${JOIN_ADDR}..."
+  JOINED=false
+  for i in $(seq 1 30); do
+    if connect_peer "${JOIN_INDEX}" "${JOIN_ADDR}"; then
+      JOINED=true
+      break
+    fi
+    sleep 2
+  done
+  if [ "${JOINED}" != "true" ]; then
+    if [ "${FRESH}" = "true" ]; then
+      log "FATAL: could not join instance ${JOIN_INDEX} after 60s, so this new node cannot join the cluster."
+      exit 1
+    fi
+    # A node with a layout reconnects to the peers it has stored.
+    log "WARNING: could not reach instance ${JOIN_INDEX}; relying on this node's stored peer list."
+  fi
+fi
 
-ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
-NODE_INFO_URL="http://${LEADER_IP}:${ADMIN_PORT}/v2/GetNodeInfo?node=self"
-
-echo "Reading the first instance's node id from ${NODE_INFO_URL}..."
-LEADER_ID=""
-for i in $(seq 1 30); do
-  LEADER_ID=$(curl --silent --max-time 5 \
-      --header "Authorization: Bearer $(cat "${ADMIN_TOKEN_FILE}")" \
-      "${NODE_INFO_URL}" 2>/dev/null \
-    | grep -o '"nodeId": *"[0-9a-f]\{64\}"' | grep -o '[0-9a-f]\{64\}' | head -n1 || true)
-  if [ -n "${LEADER_ID}" ]; then
+# ── wait for /health ─────────────────────────────────────────────────────────
+# /health answers 200 once the node can serve reads and writes, which needs
+# a quorum of the nodes holding each partition.
+#
+# A fresh node answers 503 until post-deploy assigns it a role, so that
+# counts as started.
+#
+# A node with a layout also answers 503 when its peers are down, which is
+# what every node sees first when a fully stopped cluster starts one
+# instance at a time. Failing here would stop BOSH from ever starting the
+# other instances, so after a grace period a 503 is accepted with a warning
+# when this node is up and Garage lists some peers as failed. When every
+# peer is reachable and the node still answers 503, something else is wrong
+# and post-start fails.
+GRACE=45
+DEADLINE=120
+START=${SECONDS}
+OUTCOME=""
+while :; do
+  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${LOCAL_ADMIN_URL}/health" || true)
+  ELAPSED=$((SECONDS - START))
+  if [ "${CODE}" = "200" ]; then
+    OUTCOME=healthy
     break
+  fi
+  if [ "${CODE}" = "503" ] && [ "${FRESH}" = "true" ]; then
+    OUTCOME=fresh
+    break
+  fi
+  if [ "${CODE}" = "503" ] && [ "${ELAPSED}" -ge "${GRACE}" ]; then
+    if STATUS=$("${GARAGE_BIN}" status 2>&1); then
+      FAILED=$(failed_rows <<< "${STATUS}" | awk '{ print $1 }' | paste -sd ' ' -)
+      if [ -n "${FAILED}" ]; then
+        OUTCOME=peers-down
+        break
+      fi
+    fi
+  fi
+  if [ "${ELAPSED}" -ge "${DEADLINE}" ]; then
+    log "FATAL: Garage did not report healthy within ${DEADLINE}s. Last HTTP code: ${CODE}"
+    "${GARAGE_BIN}" status 2>&1 || true
+    exit 1
   fi
   sleep 2
 done
 
-if [ -z "${LEADER_ID}" ]; then
-  if [ "${FRESH}" = "true" ]; then
-    echo "FATAL: could not read the first instance's node id after 60s, so this new node cannot join the cluster."
-    exit 1
-  fi
-  # This node already belongs to an applied layout and reconnects to the
-  # peers it has stored, so a missing first instance is not fatal here.
-  echo "WARNING: could not read the first instance's node id; relying on this node's stored peer list."
-  exit 0
-fi
+case "${OUTCOME}" in
+  healthy)
+    log "Garage is healthy." ;;
+  fresh)
+    log "Garage is running and has no cluster layout yet; post-deploy will assign one." ;;
+  peers-down)
+    log "WARNING: Garage is running, but its peers ${FAILED} are unreachable, so it has no quorum yet."
+    log "WARNING: accepting the start so BOSH can start the other instances. The cluster serves"
+    log "WARNING: reads and writes again once enough of them are up; check \`garage status\` after the deploy."
+    "${GARAGE_BIN}" status 2>&1 || true ;;
+esac
 
-echo "Connecting to ${LEADER_ID:0:16}@${LEADER_IP}:${LEADER_PORT}..."
-if ! "${GARAGE_BIN}" node connect "${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}"; then
-  if [ "${FRESH}" = "true" ]; then
-    echo "FATAL: garage node connect failed, so this new node cannot join the cluster."
-    exit 1
-  fi
-  echo "WARNING: garage node connect returned non-zero (the node may already be connected)."
+# ── record the replication factor ────────────────────────────────────────────
+# Garage refuses to start when a stored layout disagrees with the configured
+# replication factor, so a running node has proven the rendered value. This
+# writes the marker for a node that predates it.
+if [ ! -f "${RF_MARKER_FILE}" ]; then
+  printf '%s\n' "${RENDERED_RF}" > "${RF_MARKER_FILE}"
+  chown vcap:vcap "${RF_MARKER_FILE}"
+  chmod 0640 "${RF_MARKER_FILE}"
+  log "recorded replication factor ${RENDERED_RF} in ${RF_MARKER_FILE}."
 fi
-<% end -%>

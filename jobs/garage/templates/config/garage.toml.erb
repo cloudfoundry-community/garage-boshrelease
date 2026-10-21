@@ -7,7 +7,9 @@
   if admin_bind.empty?
     admin_bind = link('garage-rpc').instances.length == 1 ? '127.0.0.1' : spec.ip
   end
-  admin_loopback = admin_bind == '127.0.0.1'
+  admin_loopback = ['127.0.0.1', '::1'].include?(admin_bind)
+  # An IPv6 address is bracketed when a port is appended to it.
+  bracket = lambda { |a| a.to_s.include?(':') ? "[#{a}]" : a.to_s }
 -%>
 # Managed by BOSH. Do not edit manually.
 #
@@ -26,7 +28,7 @@ metadata_fsync     = <%= p('garage.metadata_fsync') %>
 compression_level  = <%= p('garage.compression_level') %>
 
 rpc_bind_addr   = "[::]:<%= rpc_port %>"
-rpc_public_addr = "<%= spec.ip %>:<%= rpc_port %>"
+rpc_public_addr = "<%= bracket.call(spec.ip) %>:<%= rpc_port %>"
 rpc_secret_file = "/var/vcap/jobs/garage/config/rpc_secret"
 
 # Peer discovery uses `garage node connect` in post-start.erb rather than
@@ -42,7 +44,7 @@ root_domain   = "<%= p('garage.s3_root_domain') %>"
 <% end -%>
 
 [admin]
-api_bind_addr    = "<%= admin_bind %>:<%= admin_port %>"
+api_bind_addr    = "<%= bracket.call(admin_bind) %>:<%= admin_port %>"
 admin_token_file = "/var/vcap/jobs/garage/config/admin_token"
 <% unless admin_loopback -%>
 # The admin API is reachable off-host, so /metrics needs the admin token too.

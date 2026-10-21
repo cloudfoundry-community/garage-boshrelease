@@ -4,8 +4,9 @@ name: garage
 description: |
   Garage S3-compatible distributed object storage. Managed by BPM.
   Scales 1 to N via the garage-rpc BOSH link for cluster peer discovery.
-  Cluster layout is auto-bootstrapped by the post-deploy hook on instance 0,
-  with opt-out via the garage.layout.manual property.
+  Cluster layout is auto-bootstrapped by the post-deploy hook on the
+  instance with the highest index, with opt-out via the garage.layout.manual
+  property.
 
 packages:
   - garage
@@ -13,6 +14,7 @@ packages:
 templates:
   bin/drain.erb:               bin/drain
   bin/env.sh.erb:              bin/env.sh
+  bin/helpers.sh.erb:          bin/helpers.sh
   bin/pre-start.erb:           bin/pre-start
   bin/post-start.erb:          bin/post-start
   bin/post-deploy.erb:         bin/post-deploy
@@ -43,18 +45,20 @@ properties:
 
   garage.admin_port:
     description: |
-      Admin API bind port. Used by post-start health polling and, in a
-      cluster, by joining nodes to read the first node's node id.
+      Admin API bind port. Post-start polls /health on it, and in a cluster
+      the lifecycle hooks read each peer's node id and layout version from
+      the peer's admin API on this port.
     default: 3903
 
   garage.admin_bind_address:
     description: |
       Address the admin API binds to. When empty, a single-node deployment
       binds to loopback (127.0.0.1) and a cluster binds to the instance's
-      own IP, because a joining node reads the first node's id from that
-      node's admin API (GetNodeInfo, bearer-token protected). Whenever the
-      admin API is not on loopback, the metrics endpoint also requires the
-      admin token.
+      own IP, because the lifecycle hooks read each peer's node id and
+      layout version from that peer's admin API, which always requires the
+      admin token. A wildcard address (0.0.0.0 or ::) is reached locally
+      through loopback. Whenever the admin API is not on loopback, the
+      metrics endpoint also requires the admin token.
     default: ""
 
   garage.s3_region:
@@ -72,6 +76,9 @@ properties:
       Replication factor for stored objects.
       1 = development (no redundancy).
       3 = production (requires 3 or more nodes in distinct availability zones).
+      Garage cannot change this value once a cluster has a layout, so
+      pre-start records it in /var/vcap/store/garage/replication_factor and
+      refuses to start a node whose rendered value differs.
     default: 1
 
   garage.db_engine:
@@ -140,7 +147,9 @@ properties:
     description: |
       When true, the post-deploy hook skips automatic layout bootstrapping.
       The operator is responsible for running garage layout assign and
-      garage layout apply manually.
+      garage layout apply manually. Once the operator's layout has been
+      applied, the next deploy still creates the root S3 key and the
+      default bucket.
     default: false
 
   garage.layout.capacity:

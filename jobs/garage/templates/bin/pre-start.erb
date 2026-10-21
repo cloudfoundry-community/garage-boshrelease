@@ -2,31 +2,86 @@
 set -euo pipefail
 
 # Managed by BOSH. Do not edit manually.
+#
+# BOSH runs this script before every deploy, and bpm runs it again as the
+# process's pre_start hook before every start, so the replication factor
+# guard below also covers a restart by monit.
+
+source /var/vcap/jobs/garage/bin/helpers.sh
 
 META_DIR="<%= p('garage.metadata_dir') %>"
 DATA_DIR="<%= p('garage.data_dir') %>"
 EPHEMERAL_DIR="/var/vcap/data/garage"
+RENDERED_RF="<%= p('garage.replication_factor').to_i %>"
 
 # Create persistent disk subdirectories.
+install -d -o vcap -g vcap -m 0750 "${GARAGE_STORE_DIR}"
 install -d -o vcap -g vcap -m 0750 "${META_DIR}"
 install -d -o vcap -g vcap -m 0750 "${DATA_DIR}"
 install -d -o vcap -g vcap -m 0750 "${EPHEMERAL_DIR}"
 
-# Write RPC shared secret to its own file (referenced by garage.toml via
-# rpc_secret_file). Garage refuses to start unless this file is mode 0600
-# (not group- or world-readable), so it is owned by the runtime user (vcap)
-# and readable only by that owner.
-RPC_SECRET_FILE=/var/vcap/jobs/garage/config/rpc_secret
+# ── replication factor guard ─────────────────────────────────────────────────
+# Garage cannot change the replication factor of a cluster once it has a
+# layout. It refuses to start when the two differ, and that crash loop is
+# much harder to read than this message. The marker records the value the
+# cluster was built with.
+if [ -f "${RF_MARKER_FILE}" ]; then
+  RECORDED_RF=$(tr -d '[:space:]' < "${RF_MARKER_FILE}")
+  if [ "${RECORDED_RF}" != "${RENDERED_RF}" ]; then
+    cat >&2 <<MSG
+FATAL: garage.replication_factor is ${RENDERED_RF} in this deploy, but this node's
+cluster was built with replication factor ${RECORDED_RF} (recorded in ${RF_MARKER_FILE}).
+
+Garage cannot change the replication factor of a cluster that already has a
+layout, and it refuses to start when the configured value differs from the
+stored one. Nothing on this node has been changed.
+
+To keep this cluster running, set garage.replication_factor back to
+${RECORDED_RF} and deploy again.
+
+To move to replication factor ${RENDERED_RF}, deploy a second Garage cluster
+with that value, copy the buckets across with an S3 tool such as rclone,
+point clients at the new cluster, and then delete this one.
+MSG
+    exit 1
+  fi
+elif [ -e "${META_DIR}/cluster_layout" ]; then
+  # This node has a layout from a release that did not write the marker.
+  # Garage itself compares the stored layout with the configuration, so
+  # post-start records the marker once Garage has started with this value.
+  echo "Garage pre-start: no replication factor marker yet; post-start records ${RENDERED_RF} once Garage accepts it."
+else
+  # A node with no layout adopts the rendered value.
+  printf '%s\n' "${RENDERED_RF}" > "${RF_MARKER_FILE}"
+  chown vcap:vcap "${RF_MARKER_FILE}"
+  chmod 0640 "${RF_MARKER_FILE}"
+fi
+
+# ── secrets ──────────────────────────────────────────────────────────────────
+# Each secret goes into its own file. Garage refuses to start unless the RPC
+# secret and admin token files are mode 0600 (not group- or world-readable),
+# so they are owned by the runtime user (vcap) and readable only by it.
 umask 077
+
+# RPC shared secret, referenced by garage.toml via rpc_secret_file.
 printf '%s' "<%= p('garage.rpc_secret') %>" > "${RPC_SECRET_FILE}"
 chown vcap:vcap "${RPC_SECRET_FILE}"
 chmod 0600 "${RPC_SECRET_FILE}"
 
-# Write admin API bearer token to its own file (referenced via admin_token_file).
-# Same 0600 / vcap-owned requirement as the RPC secret.
-ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
+# Admin API bearer token, referenced by garage.toml via admin_token_file.
 printf '%s' "<%= p('garage.admin_token') %>" > "${ADMIN_TOKEN_FILE}"
 chown vcap:vcap "${ADMIN_TOKEN_FILE}"
 chmod 0600 "${ADMIN_TOKEN_FILE}"
+
+# The same token as a curl header file, so the lifecycle scripts can pass it
+# with `curl -H @file` instead of on the command line.
+printf 'Authorization: Bearer %s\n' "<%= p('garage.admin_token') %>" > "${ADMIN_AUTH_HEADER_FILE}"
+chown root:root "${ADMIN_AUTH_HEADER_FILE}"
+chmod 0600 "${ADMIN_AUTH_HEADER_FILE}"
+
+# The root S3 secret key, which post-deploy imports through the admin API.
+printf '%s' "<%= p('garage.secret_key') %>" > "${S3_SECRET_KEY_FILE}"
+chown root:root "${S3_SECRET_KEY_FILE}"
+chmod 0600 "${S3_SECRET_KEY_FILE}"
 
 echo "Garage pre-start: directories created, secrets staged."

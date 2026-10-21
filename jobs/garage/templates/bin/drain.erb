@@ -1,43 +1,126 @@
 #!/bin/bash
 # BOSH drain script for the garage job.
 #
-# Sends SIGTERM to the BPM-managed garage process and waits up to 60 seconds
-# for a clean exit. LMDB is susceptible to corruption after unclean shutdown,
-# so this script must complete before the persistent disk is detached.
+# Drain never stops the process. Monit and bpm stop it after drain returns,
+# and a drain that signals the process itself races monit, which can restart
+# it mid-drain. Drain does two things instead.
 #
-# BOSH drain protocol: stdout must be a single integer — the seconds remaining
-# (0 = complete). All human-readable diagnostics MUST go to stderr; any
-# non-integer text on stdout fails the drain. A non-zero exit also fails it.
-set -eu
+# When BOSH is about to delete this instance (the next persistent disk size
+# is 0), drain refuses while this node still holds a role in a layout with
+# more than one node, because deleting it would take its partitions with it.
+# A node whose role has already been removed waits until the cluster has
+# finished moving data off it, and then lets BOSH go ahead.
+#
+# On any other stop or update, drain waits for the node's block resync
+# queue to empty, for up to two minutes, so blocks still in flight to other
+# nodes are not cut off.
+#
+# BOSH drain protocol: stdout must be a single integer, the seconds BOSH
+# should still wait (0 means done). All diagnostics go to stderr, and a
+# non-zero exit fails the drain. BOSH recommends waiting inside the script
+# over dynamic draining, so the waits below are loops in this script.
+set -u
+
+source /var/vcap/jobs/garage/bin/helpers.sh
 
 PIDFILE=/var/vcap/sys/run/bpm/garage/garage.pid
+DELETE_WAIT_SECS=1800
+RESYNC_WAIT_SECS=120
 
-if [ -f "${PIDFILE}" ]; then
-  PID=$(cat "${PIDFILE}")
-  if kill -0 "${PID}" 2>/dev/null; then
-    echo "garage drain: sending SIGTERM to PID ${PID}" >&2
-    kill -TERM "${PID}"
+log() { echo "[drain] $*" >&2; }
 
-    # Wait up to 60 seconds for the process to exit cleanly.
-    for i in $(seq 1 60); do
-      if ! kill -0 "${PID}" 2>/dev/null; then
-        echo "garage drain: process exited after ${i}s" >&2
-        break
-      fi
-      sleep 1
-    done
+# Every CLI call is bounded, so a wedged node cannot hang the drain.
+g() { timeout 30 "${GARAGE_BIN}" "$@"; }
 
-    # Final check — if still running after 60s, log and proceed.
-    # BOSH will escalate to SIGKILL if needed.
-    if kill -0 "${PID}" 2>/dev/null; then
-      echo "garage drain: process still running after 60s — BOSH will escalate" >&2
-    fi
-  else
-    echo "garage drain: PID ${PID} not running" >&2
+refuse() {
+  log "REFUSED: $*"
+  cat >&2 <<'MSG'
+[drain] To remove a Garage node from a cluster, follow the scale-down procedure in the
+[drain] release README. In short, run `garage layout remove <node-id>` for each node
+[drain] that will go away, apply the layout with `garage layout apply --version <next>`,
+[drain] wait until `garage layout history` reports a stable state with a single live
+[drain] layout version, and only then lower `instances` in the manifest and deploy.
+[drain] If the node is already gone from the layout and its process cannot run, deploy
+[drain] with `--skip-drain` for this instance group.
+MSG
+  exit 1
+}
+
+process_running() {
+  local pid
+  [ -f "${PIDFILE}" ] || return 1
+  pid=$(< "${PIDFILE}")
+  [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+}
+
+NEXT_DISK=$(printf '%s' "${BOSH_JOB_NEXT_STATE:-}" \
+  | grep -o '"persistent_disk" *: *[0-9]*' | grep -o '[0-9]*$' || true)
+
+if [ "${NEXT_DISK}" = "0" ]; then
+  log "BOSH is deleting this instance (next persistent disk size is 0)."
+  if ! process_running; then
+    refuse "the garage process is not running, so drain cannot check whether this node still holds a layout role."
   fi
-else
-  echo "garage drain: pidfile not found — process not running" >&2
+  load_rpc_secret
+  SELF_ID=$(g node id -q 2>/dev/null | cut -c1-16)
+  LAYOUT_OUT=$(g layout show 2>/dev/null) || LAYOUT_OUT=""
+  if [ -z "${SELF_ID}" ] || [ -z "${LAYOUT_OUT}" ]; then
+    refuse "the local Garage node did not answer, so drain cannot check whether it still holds a layout role."
+  fi
+  ROLES=$(current_layout_rows <<< "${LAYOUT_OUT}" | awk '{ print $1 }')
+  ROLE_COUNT=$(awk 'NF' <<< "${ROLES}" | wc -l | tr -d ' ')
+  if grep -qxF "${SELF_ID}" <<< "${ROLES}"; then
+    if [ "${ROLE_COUNT}" -gt 1 ]; then
+      refuse "node ${SELF_ID} still holds a role in a ${ROLE_COUNT}-node layout, and deleting it would take its share of the data with it."
+    fi
+    log "node ${SELF_ID} is the only node in the layout, so the whole cluster is being deleted."
+    echo 0
+    exit 0
+  fi
+
+  # The role is gone. Wait until no older layout version is still live,
+  # which means the cluster has finished moving this node's data elsewhere.
+  log "node ${SELF_ID} holds no role; waiting for the cluster to finish moving its data."
+  START=${SECONDS}
+  while :; do
+    if g layout history 2>/dev/null | grep -q 'stable state with a single live layout version'; then
+      log "the cluster layout is stable, so this node can be deleted."
+      echo 0
+      exit 0
+    fi
+    if [ $((SECONDS - START)) -ge "${DELETE_WAIT_SECS}" ]; then
+      refuse "the cluster was still moving data off node ${SELF_ID} after ${DELETE_WAIT_SECS}s. Check \`garage layout history\`, and deploy again once it reports a stable state."
+    fi
+    sleep 10
+  done
 fi
 
-# Signal drain complete. BOSH treats exit 0 + stdout "0" as drain complete.
+# ── ordinary stop or update ──────────────────────────────────────────────────
+if ! process_running; then
+  log "the garage process is not running; nothing to drain."
+  echo 0
+  exit 0
+fi
+
+load_rpc_secret
+START=${SECONDS}
+while :; do
+  QUEUE=$(g stats 2>/dev/null \
+    | awk -F': *' '/resync queue length/ { gsub(/ /, "", $2); print $2; exit }')
+  if [ -z "${QUEUE}" ]; then
+    log "could not read the block resync queue; letting BOSH stop the process."
+    break
+  fi
+  if [ "${QUEUE}" = "0" ]; then
+    log "the block resync queue is empty."
+    break
+  fi
+  if [ $((SECONDS - START)) -ge "${RESYNC_WAIT_SECS}" ]; then
+    log "WARNING: ${QUEUE} block(s) are still queued for resync after ${RESYNC_WAIT_SECS}s; letting BOSH stop the process. Garage resumes the resync when the node starts again."
+    break
+  fi
+  log "waiting for ${QUEUE} block(s) in the resync queue..."
+  sleep 5
+done
+
 echo 0

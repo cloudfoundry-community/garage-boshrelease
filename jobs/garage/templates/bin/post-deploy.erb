@@ -3,97 +3,100 @@ set -euo pipefail
 
 # Managed by BOSH. Do not edit manually.
 #
-# Idempotent cluster layout bootstrap. Runs on every deploy. No-op when:
-#   - garage.layout.manual is true (operator manages layout via mc addon), or
-#   - this is not the last instance index (highest index in the BOSH link), or
-#   - no nodes report "NO ROLE ASSIGNED" in `garage status`.
+# Idempotent cluster layout bootstrap, run on every deploy by the instance
+# with the highest index in the garage-rpc link. BOSH updates instances in
+# index order, so by the time that instance runs post-deploy every other
+# instance has finished post-start and joined the cluster. Indexes are not
+# always contiguous, so the acting instance is chosen by its index and never
+# by the instance count.
 #
-# In a cluster it then makes sure the root S3 key and the default bucket
-# exist. A single node gets both from `garage server --default-bucket`, but
-# Garage accepts that flag only together with --single-node.
+# The hook then:
 #
-# Running on the LAST instance (not index 0) ensures that by the time this
-# hook executes, BOSH serial deployment has already brought up every earlier
-# instance through post-start, where `garage node connect` joins each node to
-# the gossip ring. The gossip ring is fully formed, so a single layout assign
-# covers all unassigned nodes in one pass.
+#   1. waits until every instance in the link is a healthy Garage node;
+#   2. refuses to continue when the layout has staged changes it did not make;
+#   3. assigns a role to every node in the link that has none, in the zone of
+#      its BOSH AZ, and swaps it in for the failed role of the same BOSH
+#      instance with `--replace` when its disk was wiped;
+#   4. applies the next layout version;
+#   5. makes sure the root S3 key and the default bucket exist.
 #
-# On first deploy this hook assigns a role (zone + capacity) to every fresh
-# node, then bumps the layout version. On subsequent deploys it short-circuits.
+# With garage.layout.manual, steps 1 to 4 are left to the operator, and the
+# key and bucket are provisioned once the operator's layout exists.
+<%
+  peers  = link('garage-rpc').instances
+  acting = peers.map { |i| i.index }.max
+-%>
+
+source /var/vcap/jobs/garage/bin/helpers.sh
+load_rpc_secret
 
 INSTANCE_INDEX="<%= spec.index %>"
-EXPECTED_PEERS="<%= link('garage-rpc').instances.length %>"
-LAST_INDEX=$(( EXPECTED_PEERS - 1 ))
+ACTING_INDEX="<%= acting %>"
+EXPECTED_PEERS="<%= peers.length %>"
 MANUAL_LAYOUT="<%= p('garage.layout.manual') %>"
-ZONE="<%= spec.az %>"
+LOCAL_ZONE="<%= spec.az || '' %>"
+CAPACITY="<%= p('garage.layout.capacity') %>"
+ACCESS_KEY="<%= p('garage.access_key') %>"
+DEFAULT_BUCKET="<%= p('garage.default_bucket') %>"
 
-# Address and AZ of every instance in the garage-rpc link, one "address az"
-# pair per line, so each node is assigned the zone of the AZ it runs in.
-PEER_AZS="$(cat <<'PEERS'
-<% link('garage-rpc').instances.each do |i| -%>
-<%= i.address %> <%= i.az %>
+# One "index instance-id az address name" line per link instance. An
+# instance without an AZ is written with "-".
+LINK_INSTANCES="$(cat <<'PEERS'
+<% peers.each do |i| -%>
+<%= i.index %> <%= i.id %> <%= (i.az.nil? || i.az.to_s.empty?) ? '-' : i.az %> <%= i.address %> <%= i.name %>
 <% end -%>
 PEERS
 )"
-CAPACITY="<%= p('garage.layout.capacity') %>"
-ACCESS_KEY="<%= p('garage.access_key') %>"
-SECRET_KEY="<%= p('garage.secret_key') %>"
-DEFAULT_BUCKET="<%= p('garage.default_bucket') %>"
-
-GARAGE_BIN=/var/vcap/packages/garage/bin/garage
-export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
-
-# Do NOT set GARAGE_RPC_HOST for local CLI calls. In garage v2.x the variable
-# must be a full "<node-id>@<ip>:<port>" identifier; a bare "host:port" is
-# rejected with "Invalid RPC remote node identifier". With the variable unset,
-# the CLI connects to the local node using rpc_bind_addr from the config file,
-# which is exactly what every command in this hook needs.
-
-# The RPC secret authenticates CLI commands to the cluster. Read from file
-# rather than embedding in the environment at render time, so that the secret
-# is never baked into the BOSH manifest or logged by the agent.
-export GARAGE_RPC_SECRET
-GARAGE_RPC_SECRET="$(cat /var/vcap/jobs/garage/config/rpc_secret)"
 
 log() { echo "[post-deploy] $*"; }
+die() { echo "[post-deploy] FATAL: $*" >&2; exit 1; }
 
-# Prints the applied cluster layout version, or 0 when there is none yet.
-# Garage v2 prints "Current cluster layout version: N" in `garage layout show`.
-layout_version() {
-  local v
-  v=$("${GARAGE_BIN}" layout show 2>/dev/null \
-    | awk -F': *' '/^Current cluster layout version:/ { print $2; exit }' || true)
-  echo "${v:-0}"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+# ── root key and default bucket ──────────────────────────────────────────────
+# A single node gets both from `garage server --default-bucket`. A cluster
+# gets them here. The secret key is read from the 0600 file that pre-start
+# writes and sent to the local admin API in a request body file, so it never
+# appears on a command line. Every step is idempotent.
+import_root_key() {
+  local body="${TMP_DIR}/import-key.json" secret
+  secret="$(< "${S3_SECRET_KEY_FILE}")"
+  ( umask 077
+    printf '{"accessKeyId":"%s","secretAccessKey":"%s","name":"default access key"}' \
+      "${ACCESS_KEY}" "${secret}" > "${body}" )
+  admin_curl --request POST --header 'Content-Type: application/json' \
+    --data-binary @"${body}" "${LOCAL_ADMIN_URL}/v2/ImportKey" >/dev/null 2>&1
+  local rc=$?
+  rm -f "${body}"
+  return ${rc}
 }
 
-# Creates the root S3 key and the default bucket when they are missing and
-# grants the key full access to the bucket. Every step is idempotent. The
-# secret key is passed to the CLI and is never echoed.
 provision_root_key_and_bucket() {
   if [ "${EXPECTED_PEERS}" -le 1 ]; then
     return 0
   fi
-  if [ -z "${ACCESS_KEY}" ] || [ -z "${SECRET_KEY}" ]; then
-    log "garage.access_key or garage.secret_key is empty — skipping root key provisioning."
+  if [ -z "${ACCESS_KEY}" ] || [ ! -s "${S3_SECRET_KEY_FILE}" ]; then
+    log "garage.access_key or garage.secret_key is empty, so the root S3 key is not provisioned."
     return 0
   fi
 
   # Bucket and key writes need a quorum on the new layout, which can take a
   # few seconds to settle after `garage layout apply`.
-  local ok=false
+  local ok=false i
   for i in $(seq 1 30); do
     if "${GARAGE_BIN}" key info "${ACCESS_KEY}" >/dev/null 2>&1; then
       ok=true
       break
     fi
-    if "${GARAGE_BIN}" key import --yes -n "default access key" "${ACCESS_KEY}" "${SECRET_KEY}" >/dev/null 2>&1; then
+    if import_root_key; then
       log "imported the root S3 key ${ACCESS_KEY}."
       ok=true
       break
     fi
     sleep 2
   done
-  [ "${ok}" = "true" ] || { log "FATAL: could not import the root S3 key after 60s."; exit 1; }
+  [ "${ok}" = "true" ] || die "could not import the root S3 key after 60s."
 
   ok=false
   for i in $(seq 1 30); do
@@ -108,125 +111,243 @@ provision_root_key_and_bucket() {
     fi
     sleep 2
   done
-  [ "${ok}" = "true" ] || { log "FATAL: could not create the default bucket ${DEFAULT_BUCKET} after 60s."; exit 1; }
+  [ "${ok}" = "true" ] || die "could not create the default bucket ${DEFAULT_BUCKET} after 60s."
 
   "${GARAGE_BIN}" bucket allow --read --write --owner "${DEFAULT_BUCKET}" --key "${ACCESS_KEY}" >/dev/null
   log "root S3 key has read, write, and owner access to ${DEFAULT_BUCKET}."
 }
 
-# ── opt-out: operator manages layout manually ─────────────────────────────────
-if [ "${MANUAL_LAYOUT}" = "true" ]; then
-  log "garage.layout.manual=true — skipping auto-bootstrap. Use mc addon or CLI."
+# ── only the highest index drives the cluster-wide operation ─────────────────
+if [ "${INSTANCE_INDEX}" != "${ACTING_INDEX}" ]; then
+  log "instance index ${INSTANCE_INDEX} is not the highest in the link (${ACTING_INDEX}), so it leaves the layout alone."
   exit 0
 fi
 
-# ── only the last instance drives the cluster-wide operation ─────────────────
-# BOSH deploys instances serially (canaries=1). By the time the last instance
-# runs post-deploy, all earlier instances have completed post-start and called
-# `garage node connect`, so the gossip ring is fully formed.
-if [ "${INSTANCE_INDEX}" != "${LAST_INDEX}" ]; then
-  log "instance index ${INSTANCE_INDEX} is not the last (${LAST_INDEX}) — auto-bootstrap runs only on the last instance."
-  exit 0
-fi
-
-# ── wait until all expected peers are visible in garage status ────────────────
-# Even though every prior instance has finished post-start, gossip propagation
-# may take a few seconds. Poll until EXPECTED_PEERS nodes appear.
-log "waiting for ${EXPECTED_PEERS} peer(s) to appear in garage status..."
-VISIBLE=0
-for i in $(seq 1 30); do
-  # `|| true` keeps a transient non-zero `garage status` (RPC not yet ready)
-  # from tripping `set -e`; the loop retries until peers appear.
-  VISIBLE=$("${GARAGE_BIN}" status 2>/dev/null | awk 'NR>1 && /^[a-f0-9]/' | wc -l | tr -d ' ' || true)
-  VISIBLE=${VISIBLE:-0}
-  if [ "${VISIBLE}" -ge "${EXPECTED_PEERS}" ]; then
-    log "all ${VISIBLE} peer(s) visible."
-    break
-  fi
-  log "  saw ${VISIBLE}/${EXPECTED_PEERS} after ${i} attempt(s), retrying..."
-  sleep 2
-done
-
-if [ "${VISIBLE}" -lt "${EXPECTED_PEERS}" ]; then
-  log "WARNING: only ${VISIBLE}/${EXPECTED_PEERS} peer(s) visible after 60s. Proceeding with what is reachable."
-fi
-
-# ── wait for the local node to be reachable via the RPC layer ─────────────────
+# ── wait for the local node to answer over RPC ───────────────────────────────
 log "waiting up to 60s for local garage RPC..."
 for i in $(seq 1 30); do
-  if "${GARAGE_BIN}" status >/dev/null 2>&1; then
-    break
-  fi
+  "${GARAGE_BIN}" status >/dev/null 2>&1 && break
   sleep 2
 done
-if ! "${GARAGE_BIN}" status >/dev/null 2>&1; then
-  log "FATAL: garage status failed after 60s; aborting bootstrap."
-  exit 1
-fi
+"${GARAGE_BIN}" status >/dev/null 2>&1 || die "garage status failed after 60s; aborting bootstrap."
 
-# ── capture full status output once ───────────────────────────────────────────
-STATUS_OUTPUT="$("${GARAGE_BIN}" status 2>&1)"
-echo "${STATUS_OUTPUT}"
-
-# ── extract unassigned node IDs ────────────────────────────────────────────────
-# Garage status output format (fresh node):
-#   ID                Hostname            Address               Tags  Zone  Capacity  DataAvail
-#   abcd1234ef567890  garage/0            10.0.0.1:3901         NO ROLE ASSIGNED
-#
-# We grab the ID and Address columns for lines that contain "NO ROLE ASSIGNED".
-# The hostname column shows "?" for a node that has not reported in yet, so
-# the columns stay in place.
-UNASSIGNED=$(echo "${STATUS_OUTPUT}" \
-  | awk '/NO ROLE ASSIGNED/ { print $1, $3 }' \
-  | sort -u)
-UNASSIGNED_IDS=$(echo "${UNASSIGNED}" | awk 'NF { print $1 }')
-
-# Prints the AZ of the link instance at the given IP. Link addresses may be
-# BOSH DNS names, so each one is resolved before it is compared. Falls back
-# to this instance's AZ when no link instance matches.
-zone_for_ip() {
-  local want="$1" addr az ip
-  while read -r addr az; do
-    [ -n "${addr}" ] || continue
-    ip=$(getent hosts "${addr}" 2>/dev/null | awk '{print $1; exit}' || true)
-    ip="${ip:-${addr}}"
-    if [ "${ip}" = "${want}" ]; then
-      echo "${az:-${ZONE}}"
-      return 0
-    fi
-  done <<< "${PEER_AZS}"
-  echo "${ZONE}"
-}
-
-if [ -z "${UNASSIGNED_IDS}" ]; then
-  log "no unassigned nodes — cluster layout already established."
-  provision_root_key_and_bucket
+# ── manual layout: provision once the operator's layout exists ───────────────
+if [ "${MANUAL_LAYOUT}" = "true" ]; then
+  LAYOUT_OUT=$("${GARAGE_BIN}" layout show 2>&1) || die "garage layout show failed: ${LAYOUT_OUT}"
+  ROLES=$(current_layout_rows <<< "${LAYOUT_OUT}" | wc -l | tr -d ' ')
+  if [ "${ROLES}" -gt 0 ]; then
+    log "garage.layout.manual is true and the operator's layout has ${ROLES} role(s), so only the root key and bucket are provisioned."
+    provision_root_key_and_bucket
+  else
+    log "garage.layout.manual is true and no layout has been applied yet."
+    log "waiting for the operator's layout; the root key and default bucket are created on the first deploy after it is applied."
+  fi
   exit 0
 fi
 
-log "found unassigned nodes:"
-echo "${UNASSIGNED_IDS}"
+# ── map link instances to addresses ──────────────────────────────────────────
+# One "ip index instance-id zone name" line per instance whose address
+# resolves.
+LINK_TABLE=""
+while read -r IDX IID AZ ADDR NAME; do
+  [ -n "${IDX}" ] || continue
+  if ! IP=$(resolve_ipv4 "${ADDR}"); then
+    log "WARNING: ============================================================"
+    log "WARNING: the address ${ADDR} of instance ${NAME}/${IDX} does not resolve to an IPv4 address,"
+    log "WARNING: so its node cannot be matched and is left without a role."
+    log "WARNING: ============================================================"
+    continue
+  fi
+  if [ "${AZ}" = "-" ]; then
+    ZONE_FOR="${LOCAL_ZONE:-default}"
+    log "WARNING: ============================================================"
+    log "WARNING: instance ${NAME}/${IDX} has no BOSH AZ in the link, so it is placed in zone ${ZONE_FOR}."
+    log "WARNING: Garage spreads replicas across zones, so give every instance an AZ."
+    log "WARNING: ============================================================"
+  else
+    ZONE_FOR="${AZ}"
+  fi
+  LINK_TABLE+="${IP} ${IDX} ${IID} ${ZONE_FOR} ${NAME}"$'\n'
+done <<< "${LINK_INSTANCES}"
+LINK_IPS=$(awk 'NF { print $1 }' <<< "${LINK_TABLE}")
+EXPECTED_HEALTHY=$(awk 'NF' <<< "${LINK_TABLE}" | wc -l | tr -d ' ')
 
-# ── assign each unassigned node ───────────────────────────────────────────────
-# Use the first 16 hex characters as the node prefix. Garage accepts any
-# unique prefix shorter than the full 64-char ID; 16 chars balances uniqueness
-# with brevity and matches the display width in `garage status` output.
-while read -r FULL_ID NODE_ADDR; do
-  [ -n "${FULL_ID}" ] || continue
-  PREFIX="${FULL_ID:0:16}"
-  NODE_ZONE=$(zone_for_ip "${NODE_ADDR%:*}")
-  log "assigning role: id=${PREFIX} address=${NODE_ADDR} zone=${NODE_ZONE} capacity=${CAPACITY}"
-  "${GARAGE_BIN}" layout assign "${PREFIX}" -z "${NODE_ZONE}" -c "${CAPACITY}"
+# Prints how many distinct link addresses have a healthy node in the given
+# `garage status` output.
+count_healthy_link_nodes() {
+  local addr n=0
+  while read -r addr; do
+    [ -n "${addr}" ] || continue
+    grep -qxF "$(strip_port "${addr}")" <<< "${LINK_IPS}" && n=$((n + 1))
+  done < <(healthy_rows <<< "$1" | awk '{ print $3 }' | sort -u)
+  echo "${n}"
+}
+
+# ── wait until every link instance is a healthy node ─────────────────────────
+log "waiting for ${EXPECTED_HEALTHY} healthy node(s) from the garage-rpc link..."
+HEALTHY=0
+STATUS_OUTPUT=""
+for i in $(seq 1 30); do
+  STATUS_OUTPUT=$("${GARAGE_BIN}" status 2>&1) || STATUS_OUTPUT=""
+  HEALTHY=$(count_healthy_link_nodes "${STATUS_OUTPUT}")
+  if [ "${HEALTHY}" -ge "${EXPECTED_HEALTHY}" ]; then
+    log "every link instance has a healthy node."
+    break
+  fi
+  log "  ${HEALTHY}/${EXPECTED_HEALTHY} healthy after ${i} attempt(s), retrying..."
+  sleep 2
+done
+echo "${STATUS_OUTPUT}"
+if [ "${HEALTHY}" -lt "${EXPECTED_HEALTHY}" ]; then
+  die "only ${HEALTHY} of ${EXPECTED_HEALTHY} link instances are healthy Garage nodes after 60s. Changing the layout while nodes are missing could assign roles to the wrong set of nodes, so the bootstrap stops here."
+fi
+
+# ── wait until this node has the newest layout ───────────────────────────────
+# A node that has just joined learns the cluster layout from its peers a
+# moment later. Until then it reports an older version, for example 0 when a
+# single node that already made its own layout is scaled out, and a layout
+# built on that stale view would be rejected or would drop existing roles.
+# Every link instance reports its layout version through its admin API.
+highest_peer_version() {
+  local ip v max=0
+  while read -r ip; do
+    [ -n "${ip}" ] || continue
+    v=$(admin_curl --connect-timeout 3 "http://$(host_port "${ip}" "${ADMIN_PORT}")/v2/GetClusterLayout" 2>/dev/null \
+      | grep -o '"version": *[0-9]*' | head -n1 | grep -o '[0-9]*$') || v=""
+    [ -n "${v}" ] && [ "${v}" -gt "${max}" ] && max="${v}"
+  done <<< "${LINK_IPS}"
+  echo "${max}"
+}
+SYNCED=false
+for i in $(seq 1 30); do
+  LOCAL_VERSION=$(layout_version) || die "could not read the cluster layout version."
+  PEER_VERSION=$(highest_peer_version)
+  if [ "${LOCAL_VERSION}" -ge "${PEER_VERSION}" ]; then
+    SYNCED=true
+    break
+  fi
+  log "  the local layout is version ${LOCAL_VERSION}, but a peer has version ${PEER_VERSION}; waiting for it to arrive..."
+  sleep 2
+done
+if [ "${SYNCED}" != "true" ]; then
+  die "the local node still has layout version ${LOCAL_VERSION} after 60s, while a peer has version ${PEER_VERSION}. Check \`garage status\` and \`garage layout show\` on each node, and deploy again once they agree."
+fi
+# The roles in `garage status` come from the layout, so read it again now
+# that the layout is current.
+STATUS_OUTPUT=$("${GARAGE_BIN}" status 2>&1) || die "garage status failed: ${STATUS_OUTPUT}"
+
+# ── refuse to apply changes the hook did not stage ───────────────────────────
+# `garage layout apply` commits everything that is staged, so a pending
+# removal or capacity change by an operator would be committed unreviewed.
+LAYOUT_OUT=$("${GARAGE_BIN}" layout show 2>&1) || die "garage layout show failed: ${LAYOUT_OUT}"
+if has_staged_changes <<< "${LAYOUT_OUT}"; then
+  echo "${LAYOUT_OUT}"
+  die "the cluster layout has staged changes that this deploy did not make. Review them with \`garage layout show\`, then either apply them with \`garage layout apply --version <next>\` or drop them with \`garage layout revert\`, and deploy again."
+fi
+CURRENT_VERSION=$(layout_version) || die "could not read the cluster layout version."
+
+# ── find nodes without a role, and the roles they replace ────────────────────
+# Healthy rows read "ID Hostname Address Tags Zone ...", and a node without
+# a role has an empty Tags column followed by "NO ROLE ASSIGNED".
+HEALTHY_ROWS=$(healthy_rows <<< "${STATUS_OUTPUT}")
+NODE_ROWS=$(printf '%s\n%s\n' "${HEALTHY_ROWS}" "$(failed_rows <<< "${STATUS_OUTPUT}")")
+UNASSIGNED=$(awk '/NO ROLE ASSIGNED/ { print $1, $2, $3 }' <<< "${HEALTHY_ROWS}")
+# Current layout rows read "ID Tags Zone Capacity ...".
+ROLE_TAGS=$(current_layout_rows <<< "${LAYOUT_OUT}" | awk '{ print $1, $2 }')
+
+# Prints the role that a node without a role replaces, or nothing. One BOSH
+# instance runs one Garage node, so a role that belongs to the same instance
+# under another node id is that instance's old identity, lost with its disk.
+# Garage keeps listing that identity as healthy for a while after its VM
+# goes away, and it forgets a failed node's address, so the match does not
+# depend on whether Garage has noticed the failure yet.
+#
+# Every role this hook assigns carries a "bosh-id-<instance id>" tag, which
+# is matched first. A role without that tag, from an earlier release, is
+# matched by the same hostname or the same last known address.
+old_role_for() {
+  local nid="$1" host="$2" addr="$3" iid="$4" rid tags rhost raddr
+  while read -r rid tags; do
+    [ -n "${rid}" ] && [ "${rid}" != "${nid}" ] || continue
+    case "${tags}" in
+      *"bosh-id-${iid}"[],]*) echo "${rid}"; return 0 ;;
+    esac
+  done <<< "${ROLE_TAGS}"
+  while read -r rid tags; do
+    [ -n "${rid}" ] && [ "${rid}" != "${nid}" ] || continue
+    case "${tags}" in *bosh-id-*) continue ;; esac
+    rhost=$(awk -v id="${rid}" '$1 == id { print $2; exit }' <<< "${NODE_ROWS}")
+    raddr=$(awk -v id="${rid}" '$1 == id { print $3; exit }' <<< "${HEALTHY_ROWS}")
+    if { [ "${host}" != "?" ] && [ "${rhost}" = "${host}" ]; } \
+       || { [ -n "${raddr}" ] && [ "${raddr}" = "${addr}" ]; }; then
+      echo "${rid}"
+      return 0
+    fi
+  done <<< "${ROLE_TAGS}"
+}
+
+ASSIGNED=0
+REPLACED=""
+while read -r NODE_ID NODE_HOST NODE_ADDR; do
+  [ -n "${NODE_ID}" ] || continue
+  NODE_IP=$(strip_port "${NODE_ADDR}")
+  ENTRY=$(awk -v ip="${NODE_IP}" '$1 == ip { print; exit }' <<< "${LINK_TABLE}")
+  if [ -z "${ENTRY}" ]; then
+    log "WARNING: node ${NODE_ID} at ${NODE_ADDR} has no role, but its address is not in the garage-rpc link, so it is left alone."
+    continue
+  fi
+  read -r _ IDX IID NODE_ZONE NAME <<< "${ENTRY}"
+  OLD_ID=$(old_role_for "${NODE_ID}" "${NODE_HOST}" "${NODE_ADDR}" "${IID}")
+  REPLACE_ARGS=()
+  if [ -n "${OLD_ID}" ]; then
+    REPLACE_ARGS=(--replace "${OLD_ID}")
+    REPLACED+="${OLD_ID} "
+    log "node ${NODE_ID} on ${NAME}/${IDX} replaces role ${OLD_ID}, the identity the same instance had before its disk was replaced."
+  fi
+  log "assigning role: id=${NODE_ID} instance=${NAME}/${IDX} address=${NODE_ADDR} zone=${NODE_ZONE} capacity=${CAPACITY}"
+  "${GARAGE_BIN}" layout assign "${NODE_ID}" -z "${NODE_ZONE}" -c "${CAPACITY}" \
+    -t "bosh-id-${IID}" -t "${NAME}/${IDX}" "${REPLACE_ARGS[@]}" >/dev/null
+  ASSIGNED=$((ASSIGNED + 1))
 done <<< "${UNASSIGNED}"
 
-# ── apply layout with version + 1 ─────────────────────────────────────────────
-# A brand-new cluster reports version 0, so its first layout is version 1.
-CURRENT_VERSION=$(layout_version)
-NEXT_VERSION=$(( CURRENT_VERSION + 1 ))
+if [ "${ASSIGNED}" -eq 0 ]; then
+  log "no unassigned nodes, so the cluster layout is already established."
+else
+  NEXT_VERSION=$((CURRENT_VERSION + 1))
+  log "applying layout version ${NEXT_VERSION}..."
+  "${GARAGE_BIN}" layout apply --version "${NEXT_VERSION}"
+  log "bootstrap complete. New cluster layout version: ${NEXT_VERSION}."
 
-log "applying layout version ${NEXT_VERSION}..."
-"${GARAGE_BIN}" layout apply --version "${NEXT_VERSION}"
+  if [ -n "${REPLACED}" ]; then
+    # A replaced node's identity is gone with its disk, so the layout would
+    # otherwise wait forever for it to hand its data over. This marks those
+    # nodes as caught up. Garage refuses when the remaining nodes do not
+    # hold a quorum of every partition, and the data then stays put.
+    # Garage only skips nodes it already sees as down, so wait for that.
+    for i in $(seq 1 30); do
+      STILL_UP=""
+      for RID in ${REPLACED}; do
+        "${GARAGE_BIN}" status 2>/dev/null | healthy_rows | awk '{ print $1 }' | grep -qxF "${RID}" && STILL_UP+="${RID} "
+      done
+      [ -z "${STILL_UP}" ] && break
+      log "  waiting for Garage to see ${STILL_UP}as down..."
+      sleep 2
+    done
+    if "${GARAGE_BIN}" layout skip-dead-nodes --version "${NEXT_VERSION}"; then
+      log "marked the replaced node(s) ${REPLACED}as dead, so the cluster resyncs from the remaining copies."
+    else
+      log "WARNING: garage layout skip-dead-nodes --version ${NEXT_VERSION} failed; the layout waits for the replaced node(s) ${REPLACED}until it is run by hand."
+    fi
+  fi
+fi
 
-log "bootstrap complete. New cluster layout version: ${NEXT_VERSION}."
+# Any failed role that nothing replaced still holds partitions.
+LEFT=$("${GARAGE_BIN}" status 2>&1 | failed_rows | awk '{ print $1 }' || true)
+for FID in ${LEFT}; do
+  if awk -v id="${FID}" '$1 == id { found = 1 } END { exit !found }' <<< "$("${GARAGE_BIN}" layout show 2>/dev/null | current_layout_rows)"; then
+    log "WARNING: the layout still holds the failed role ${FID}, so its partitions have fewer reachable copies."
+    log "WARNING: if that node is gone for good, run \`garage layout remove ${FID}\`, apply the layout, and run \`garage layout skip-dead-nodes\`."
+  fi
+done
 
 provision_root_key_and_bucket
