@@ -32,6 +32,10 @@ S3_SECRET_KEY_FILE="${GARAGE_JOB_DIR}/config/s3_secret_key"
 GARAGE_STORE_DIR=/var/vcap/store/garage
 RF_MARKER_FILE="${GARAGE_STORE_DIR}/replication_factor"
 
+# Pre-stop records here what BOSH is about to do with the VM, the instance,
+# and the deployment, and drain reads it. Post-start removes it.
+NEXT_STATE_FILE=/var/vcap/data/garage/next-state
+
 ADMIN_PORT="<%= p('garage.admin_port') %>"
 RPC_PORT="<%= p('garage.rpc_port') %>"
 LOCAL_ADMIN_URL="http://<%= local_admin %>:${ADMIN_PORT}"

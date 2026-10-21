@@ -16,7 +16,8 @@ set -euo pipefail
 #      until each of those nodes is up;
 #   2. refuses to continue when the layout has staged changes it did not make;
 #   3. tags every role from an earlier release with the BOSH instance whose
-#      node holds it, assigns a role to every node in the link that has none,
+#      node holds it, moves a role that single-node mode made into the zone
+#      of its BOSH AZ, assigns a role to every node in the link that has none,
 #      in the zone of its BOSH AZ, and swaps it in for the old role of the
 #      same BOSH instance with `--replace` when its disk was wiped;
 #   4. applies the next layout version;
@@ -28,7 +29,9 @@ set -euo pipefail
 # role, the hook prints the manual commands, changes nothing, and fails.
 #
 # With garage.layout.manual, steps 1 to 4 are left to the operator, and the
-# key and bucket are provisioned once the operator's layout exists.
+# key and bucket are provisioned once the operator's layout exists. A single
+# instance skips steps 1 to 4, because it either made its own layout in
+# single-node mode or kept the layout of the cluster it was scaled down from.
 <%
   peers  = link('garage-rpc').instances
   acting = peers.map { |i| i.index }.max
@@ -233,10 +236,11 @@ role_instance() {
 }
 
 # ── root key and default bucket ──────────────────────────────────────────────
-# A single node gets both from `garage server --default-bucket`. A cluster
-# gets them here. The secret key is read from the 0600 file that pre-start
-# writes and sent to the local admin API in a request body file, so it never
-# appears on a command line. Every step is idempotent.
+# A brand new single node also gets both from `garage server
+# --default-bucket`, and every deploy makes sure of them here. The secret
+# key is read from the 0600 file that pre-start writes and sent to the local
+# admin API in a request body file, so it never appears on a command line.
+# Every step is idempotent.
 #
 # Each check returns 0 when the step's work is done, 1 when it is not, and 2
 # when the state could not be read, with the reason in CHECK_ERROR. Only a 1
@@ -360,15 +364,6 @@ if [ "${INSTANCE_INDEX}" != "${ACTING_INDEX}" ]; then
   exit 0
 fi
 
-# ── a single node manages itself ─────────────────────────────────────────────
-# With one instance, Garage runs with --single-node and makes its own layout,
-# root key, and default bucket. It also refuses to start in that mode once
-# the layout version is above 1, so this hook must not change the layout.
-if [ "${EXPECTED_PEERS}" -le 1 ]; then
-  log "this is the only instance in the garage-rpc link, so Garage manages its own layout, root key, and bucket."
-  exit 0
-fi
-
 # ── wait for the local node to answer over RPC ───────────────────────────────
 log "waiting up to 60s for local garage RPC..."
 RPC_START=${SECONDS}
@@ -387,6 +382,35 @@ if [ "${MANUAL_LAYOUT}" = "true" ]; then
     log "garage.layout.manual is true and no layout has been applied yet."
     log "waiting for the operator's layout; the root key and default bucket are created on the first deploy after it is applied."
   fi
+  exit 0
+fi
+
+# ── a single instance keeps the layout it has ────────────────────────────────
+# A brand new lone node starts in single-node mode and makes its own layout,
+# root key, and default bucket. A node left over from a cluster that was
+# scaled down keeps the layout the cluster built, and drain on each deleted
+# instance has already taken that instance's role out of it. Either way this
+# hook changes no roles. It reports any role that is not this node's, and
+# makes sure the root key and the default bucket exist.
+if [ "${EXPECTED_PEERS}" -le 1 ]; then
+  read_status || die "could not read the cluster status: ${READ_ERROR}"
+  read_layout || die "could not read the cluster layout: ${READ_ERROR}"
+  SELF_ID=$(remote_node_id "${LOCAL_ADMIN_URL#http://}")
+  [ -n "${SELF_ID}" ] || die "the local admin API at ${LOCAL_ADMIN_URL} did not name its node."
+  if [ "${#ROLE_IDS[@]}" -eq 0 ]; then
+    log "this is the only instance in the garage-rpc link, and the layout has no roles yet, so there is nothing to provision."
+    exit 0
+  fi
+  for RID in "${ROLE_IDS[@]}"; do
+    [ "${RID}" != "${SELF_ID}" ] || continue
+    banner
+    warn "the layout still holds the role $(short "${RID}") (zone ${ROLE_ZONE[${RID}]}, tags $(tags_display "${RID}")), which belongs to no instance in the garage-rpc link."
+    warn "its partitions are only reachable while that node runs. If it is gone for good, run \`garage layout remove $(short "${RID}")\` and \`garage layout apply --version $((LAYOUT_VERSION + 1))\`."
+    banner
+  done
+  has_role "${SELF_ID}" || warn "this node $(short "${SELF_ID}") holds no role in layout version ${LAYOUT_VERSION}."
+  log "this is the only instance in the garage-rpc link, at layout version ${LAYOUT_VERSION}, so the layout is left as it is."
+  provision_root_key_and_bucket
   exit 0
 fi
 
@@ -532,7 +556,12 @@ NEXT_VERSION=$((CURRENT_VERSION + 1))
 # instance's own admin API names. For each instance:
 #
 # 1. Its node holds a role. An untagged role gets the instance's tags, with
-#    its zone, capacity, and existing tags kept. Nothing else changes.
+#    its zone, capacity, and existing tags kept. The one exception is the
+#    role that `garage server --single-node` makes, in zone dc1 with the
+#    tag "default" and the size of the disk as its capacity. Once that node
+#    has company, it moves to the zone of its BOSH AZ with the capacity every
+#    other node gets, because Garage would otherwise leave it out of a
+#    cluster whose nodes all sit in other zones and hold far more capacity.
 # 2. Its node has no role, and exactly one role that no link node holds
 #    carries its bosh-id tag. That role is the instance's old identity, lost
 #    with its disk, and the node replaces it with `--replace`.
@@ -565,6 +594,12 @@ describe_role() {
   echo "$(short "${rid}") (zone ${ROLE_ZONE[${rid}]}, tags $(tags_display "${rid}"), ${state})"
 }
 
+# Succeeds when a role is the one single-node mode made: zone dc1 with the
+# tag "default".
+single_node_role() {
+  [ "${ROLE_ZONE[$1]}" = "dc1" ] && [ "${ROLE_TAGS_OK[$1]}" = "1" ] && grep -qx 'default' "${TAG_DIR}/$1"
+}
+
 # Prints the arguments that tag a role for an instance: its readable
 # existing tags other than any bosh-id tag, then bosh-id-<iid> and the
 # instance name unless it already has it.
@@ -582,6 +617,7 @@ tag_args() {
 }
 
 TAG_PLAN=()        # node ids whose untagged role gets the instance tags
+ZONE_PLAN=()       # node ids whose single-node role moves to the AZ zone
 REPLACE_PLAN=()    # "node old" pairs
 NEW_PLAN=()        # node ids that get a new role
 REFUSALS=()        # lines to print before refusing
@@ -617,7 +653,9 @@ for IID in "${LINK_IIDS[@]}"; do
       fi
       continue
     fi
-    if [ -z "${OWNER}" ]; then
+    if single_node_role "${NODE}" && [ "${L_ZONE[${IID}]}" != "dc1" ]; then
+      ZONE_PLAN+=("${NODE}")
+    elif [ -z "${OWNER}" ]; then
       TAG_PLAN+=("${NODE}")
     fi
     continue
@@ -719,6 +757,13 @@ for NODE in "${TAG_PLAN[@]}"; do
   mapfile -t ARGS < <(tag_args "${NODE}" "${IID}")
   log "tagging role $(short "${NODE}") as ${L_NAME[${IID}]} (bosh-id-${IID}); its zone, capacity, and other tags stay as they are."
   stage_assign "${NODE}" "${ARGS[@]}"
+  STAGED=$((STAGED + 1))
+done
+for NODE in "${ZONE_PLAN[@]}"; do
+  IID="${NODE_IID[${NODE}]}"
+  mapfile -t ARGS < <(tag_args "${NODE}" "${IID}")
+  log "moving role $(short "${NODE}") of ${L_NAME[${IID}]}, which single-node mode made in zone dc1, to zone=${L_ZONE[${IID}]} capacity=${CAPACITY}."
+  stage_assign "${NODE}" "--zone=${L_ZONE[${IID}]}" "--capacity=${CAPACITY}" "${ARGS[@]}"
   STAGED=$((STAGED + 1))
 done
 for PAIR in "${REPLACE_PLAN[@]}"; do

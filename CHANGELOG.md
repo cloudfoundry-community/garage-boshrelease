@@ -2,6 +2,22 @@
 
 All notable changes to garage-boshrelease are documented here.
 
+## 0.2.1 (2026-10-21)
+
+### Changed
+
+- `jobs/garage` drain: when BOSH deletes one instance, drain now takes its node out of the cluster itself. It checks that the layout is stable, that nothing is staged, that no node with a role is down, and that the remaining nodes still cover the replication factor. Then it stages `garage layout remove` for its own node, checks that its removal is the only staged change, applies the next layout version, and waits until the layout is stable and the node's data directory holds no blocks. Any refusal before the apply drops the staged removal. Before, drain refused to delete a node that held a role, and once the role was gone it waited only for a stable layout, which Garage reaches before the blocks have left the node.
+- `jobs/garage` drain: a node whose role is already gone waits for its data to move, for up to `garage.drain.delete_wait_secs`, and a deploy that runs out of time leaves the node running without a role, so the next deploy picks up the wait. When blocks are still left fifteen minutes after the layout settled and nothing is queued, drain queues them once with `garage repair --yes blocks`.
+- `jobs/garage` drain: deleting the whole deployment no longer needs `bosh delete-deployment --force`, because drain lets BOSH go ahead when pre-stop reports that the deployment is being deleted.
+- `jobs/garage` bpm: Garage starts through `bin/garage-server`, which passes `--single-node --default-bucket` only when the `garage-rpc` link has one instance and the node has no stored layout yet. A cluster scaled down to one instance used to restart in single-node mode, which Garage refuses once the layout is past its first version, so the last node never came back.
+- `jobs/garage` post-deploy: when a single node grows into a cluster, the role that single-node mode made (zone `dc1`, tag `default`, and the disk size as its capacity) moves to the zone of the node's BOSH AZ with `garage.layout.capacity`, in the same layout version that adds the new nodes. Garage used to give that node no partitions, so it held no data once the cluster rebalanced.
+- `jobs/garage` post-deploy: a single instance now provisions the root key and the default bucket on every deploy, like a cluster does, and warns about any role in the layout that isn't its own node's.
+
+### Added
+
+- `jobs/garage` pre-stop: records the next state of the VM, the instance, and the deployment that BOSH passes to pre-stop, for drain to read.
+- `jobs/garage` properties: `garage.drain.delete_wait_secs` (default `3600`).
+
 ## 0.2.0 (2026-10-21)
 
 ### Changed

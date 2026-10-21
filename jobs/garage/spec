@@ -14,8 +14,10 @@ packages:
 templates:
   bin/drain.erb:               bin/drain
   bin/env.sh.erb:              bin/env.sh
+  bin/garage-server.erb:       bin/garage-server
   bin/helpers.sh.erb:          bin/helpers.sh
   bin/pre-start.erb:           bin/pre-start
+  bin/pre-stop.erb:            bin/pre-stop
   bin/post-start.erb:          bin/post-start
   bin/post-deploy.erb:         bin/post-deploy
   config/bpm.yml.erb:          config/bpm.yml
@@ -160,20 +162,33 @@ properties:
 
   garage.access_key:
     description: |
-      S3 root access key id (e.g. GK + 32 hex chars). Also exported as
-      GARAGE_DEFAULT_ACCESS_KEY so Garage auto-provisions the root key on
-      first start (requires --default-bucket / --single-node flags).
+      S3 root access key id (e.g. GK + 32 hex chars). Post-deploy imports
+      it on every deploy when it is missing. A brand new single node also
+      gets it from Garage's single-node mode through
+      GARAGE_DEFAULT_ACCESS_KEY.
 
   garage.secret_key:
     description: |
-      S3 root secret key (64 hex chars). Also exported as
-      GARAGE_DEFAULT_SECRET_KEY for auto-provisioning.
+      S3 root secret key (64 hex chars), imported together with
+      garage.access_key. A brand new single node also gets it through
+      GARAGE_DEFAULT_SECRET_KEY.
 
   garage.default_bucket:
     description: |
-      Name of the bucket Garage auto-provisions on first start when
-      GARAGE_DEFAULT_BUCKET is set. Also used by the smoke-tests errand.
+      Name of the default bucket, which post-deploy creates when it is
+      missing and grants the root S3 key read, write, and owner access to.
+      Also used by the smoke-tests errand.
     default: garage
+
+  garage.drain.delete_wait_secs:
+    description: |
+      How long drain waits, in seconds, for the remaining nodes to take over
+      the data of an instance that BOSH is deleting. Garage starts moving a
+      departing node's blocks about ten minutes after the layout change, so
+      even a small data set needs fifteen minutes or more. When the wait runs
+      out, drain fails the deploy and the node keeps running without a role,
+      so a second deploy picks up the wait where the first one stopped.
+    default: 3600
 
   garage.bpm.open_files:
     description: BPM open_files ulimit for the garage process.

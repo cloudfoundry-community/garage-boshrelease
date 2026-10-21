@@ -23,8 +23,9 @@ release:
   the instance with the highest index (opt-out via
   `garage.layout.manual: true`), replaces the role of a node that lost its
   disk, and creates the root S3 key and the default bucket.
-- Refuses a change to the replication factor, and refuses to delete a node
-  that still holds data, before either can lose anything.
+- Refuses a change to the replication factor before it can lose anything,
+  and takes a node that BOSH is deleting out of the layout and waits until
+  its data lives on the remaining nodes.
 - Delivers `rpc_secret` and `admin_token` via on-disk files, not inline in
   the TOML config, and keeps every secret off command lines.
 
@@ -114,6 +115,7 @@ bosh -d <deployment> run-errand smoke-tests
 | `garage.access_key` | *(required)* | Root S3 access key id (`GK` followed by 32 hex characters) |
 | `garage.secret_key` | *(required)* | Root S3 secret key (64 hex characters) |
 | `garage.default_bucket` | `"garage"` | Bucket created for the root key, and used by the smoke tests |
+| `garage.drain.delete_wait_secs` | `3600` | How long drain waits for the remaining nodes to take over a deleted instance's data |
 | `garage.bpm.open_files` | `65536` | BPM open_files ulimit |
 | `smoke_tests.timeout_secs` | `30` | `curl --max-time` for smoke test requests |
 
@@ -122,7 +124,7 @@ descriptions. Properties in the `smoke-tests` job mirror the main job.
 
 ## Cluster Bootstrap
 
-A single node starts with `garage server --single-node --default-bucket`. Garage then assigns the layout itself and creates the root key and the default bucket from `garage.access_key`, `garage.secret_key`, and `garage.default_bucket`.
+A brand new single node starts with `garage server --single-node --default-bucket`. Garage then assigns the layout itself and creates the root key and the default bucket from `garage.access_key`, `garage.secret_key`, and `garage.default_bucket`. The job uses those flags only when the `garage-rpc` link has one instance and the node has no stored layout yet, because Garage refuses to start in single-node mode once the layout is past its first version. Every later start, and every start of a node in a cluster, runs plain `garage server`, and post-deploy makes sure on every deploy that the root key and the default bucket exist.
 
 Garage accepts `--default-bucket` only together with `--single-node`, so a cluster starts without either flag, and the lifecycle hooks do that work instead. Two instances in the `garage-rpc` link have special jobs. The instance with the lowest index is the join target, and the instance with the highest index makes the layout changes. We choose both by index rather than by their position in the link, so a gap in the indexes after a scale-down or a recreate doesn't change which instance does what.
 
@@ -172,33 +174,49 @@ Post-deploy checks the root key, the default bucket, and the key's read, write, 
 
 ## Scaling
 
-Every change to `instances` changes the peer list that's rendered into each node's configuration, so BOSH restarts every instance, one at a time, on every scale.
+Every change to `instances` changes the peer list that's rendered into each node's configuration, so BOSH restarts every instance, one at a time, on every scale. The replication factor never changes on a scale, as [Replication Factor](#replication-factor) explains, so a cluster always keeps at least as many nodes as its replication factor.
 
 ### Scaling up
 
 We raise `instances` and deploy. The new instances join through the join target, and because the acting instance is the one with the highest index, one of the new instances gives them their roles. Garage then moves partitions onto the new nodes in the background.
 
-A deployment that grows from one instance to several also stops running with `--single-node`, and its admin API moves from loopback to the instance IP. The replication factor stays what it was, as the next section explains.
+A deployment that grows from one instance to several keeps its replication factor of 1, so every object still lives on exactly one node. Its admin API moves from loopback to the instance IP. Single-node mode gave the first node's role the zone `dc1`, the tag `default`, and the size of its disk as its capacity, so post-deploy moves that role to the zone of its BOSH AZ with `garage.layout.capacity`, in the same layout change that adds the new nodes. Without that move, Garage would leave the first node out of a cluster whose other nodes all sit in other zones and hold far more capacity, and the first node would end up with no data. To get redundancy, we build a new cluster with a higher replication factor and copy the data across, as [Moving data to a new cluster](#moving-data-to-a-new-cluster) describes.
 
 ### Scaling down
 
-Removing a node that still holds a role takes its share of the data with it, so the garage job's drain script refuses to let BOSH delete such a node from a cluster of more than one node. We take the role away first and lower the instance count only after Garage has moved the data.
+We lower `instances` and deploy, and the garage job's drain script takes each departing node out of the cluster before BOSH deletes its disk. BOSH deletes the departing instances before it updates the remaining ones, and drain runs on each departing instance in turn.
 
-1. Find the node id of each instance that's going away. `garage status` shows each role's `<instance group>/<index>` tag next to the node id. BOSH normally deletes the instances with the highest indexes, and if it picks a different one, its drain refuses and the deploy stops before anything is lost.
+1. Drain checks that the layout is stable, that nothing is staged, that no node holding a role is down, and that the nodes left behind are still at least as many as the replication factor. When any check fails, drain refuses and the deploy stops with nothing changed.
 
-2. On any node, run `garage layout remove <node id>` for each of those nodes.
+2. It stages `garage layout remove` for its own node, waits 15 seconds, and checks that its own removal is the only staged change and that the layout version hasn't moved. Otherwise it drops what it staged with `garage layout revert --yes` and refuses, so it never applies a change that someone else made.
 
-3. Check the staged change with `garage layout show`, and apply it with `garage layout apply --version <next version>`.
+3. It applies the next layout version from its own node. When Garage rejects the new layout, for example because the remaining zones can't hold every copy, drain drops the staged removal and refuses.
 
-4. Wait until `garage layout history` reports that the cluster is in a stable state with a single live layout version. That means Garage has finished moving the data off the removed nodes.
+4. It waits until `garage layout history` reports a stable state with a single live layout version, and until the node's data directory holds no blocks and its resync queue is empty. Only then does BOSH stop the node and delete it.
 
-5. Lower `instances` in the manifest and deploy.
+Garage doesn't track block moves in the layout. A layout can be stable while the departing node still holds the only copy of some blocks, and when `garage layout history` reports a stable state, it also says that block migration isn't tracked and that old nodes should stay online until their data directories are empty. So drain waits for the empty data directory as well. Garage starts deleting a block from a node that no longer stores it about ten minutes after the block's last reference has moved, which means each departing node takes at least ten to fifteen minutes even when it holds very little. When blocks are still left fifteen minutes after the layout settled and nothing is queued, drain queues every local block once with `garage repair --yes blocks`.
 
-We don't deploy between step 2 and step 5. A deploy in that window still sees the removed nodes in the link, and post-deploy gives them their roles back.
+Drain waits up to `garage.drain.delete_wait_secs`, an hour by default, for the data to move. When that runs out, it fails the deploy with what it's still waiting for. The node holds no role by then and keeps running, so nothing is lost, and the next deploy finds the role gone and goes straight back to waiting.
 
-The cluster must keep at least as many nodes as the replication factor, so a cluster with `replication_factor: 3` can't go below three nodes. We also never scale a cluster down to a single instance. With one instance the job starts Garage with `--single-node`, and Garage refuses to start in that mode once the layout has changed more than once.
+BOSH must delete the departing instances one at a time, with `max_in_flight: 1`. Two drains that apply layout versions at the same moment would give Garage two different layouts with the same version number, which Garage can't reconcile. Each drain checks for a concurrent change before it applies, but a parallel scale-down is still unsafe, so we never scale down with `--max-in-flight` above 1 or with an update block that runs instances in parallel.
 
-When drain refuses, it prints these steps. When the role is gone but Garage is still moving data, drain waits up to 30 minutes for the layout to become stable, and then refuses. If a node is already out of the layout and its process can't run, we deploy with `--skip-drain` for that instance group. Deleting the whole deployment with `bosh delete-deployment` drains every instance as well, and every drain refuses, so we pass `--force` to delete a cluster we no longer want.
+A scale-down to a single instance works when the replication factor is 1. Drain removes every other node, and the last node keeps the cluster's layout and starts as plain `garage server`, because single-node mode refuses a layout that is past its first version. A cluster with a higher replication factor can't go below that many nodes, so it moves its data to a new single-node deployment instead.
+
+We can still take a node out by hand before a deploy, with `garage layout remove <node id>` and `garage layout apply --version <next version>`. Drain then finds the role gone and only waits for the data to move. We don't deploy without lowering `instances` in the meantime, because post-deploy gives every node in the link its role back.
+
+Deleting the whole deployment with `bosh delete-deployment` needs no `--force`. Pre-stop tells drain that the whole deployment is going away, and drain lets BOSH go ahead at once. If a departing node's process can't run, drain refuses, because it can't tell whether the node still holds data. We only deploy with `--skip-drain` for that instance group after we've confirmed that the node's role is gone and that its data exists on the other nodes.
+
+### Moving data to a new cluster
+
+Garage can't change the replication factor of a cluster, so a change of replication factor, or a cluster with a factor above 1 that should end up on one node, means a second deployment and a copy.
+
+1. Deploy a second Garage deployment with the new shape, under its own deployment name and on its own IPs.
+
+2. Create each bucket on the new cluster, and copy every object across with an S3 tool, for example `rclone sync old:<bucket> new:<bucket>`. A key that we created by hand on the old cluster is created again on the new one.
+
+3. Stop writes to the old cluster, run the copy again so it picks up the last changes, and compare the object lists and checksums, for example with `rclone check old:<bucket> new:<bucket>`.
+
+4. Point clients at the new cluster, and delete the old deployment once nothing uses it.
 
 ### Drain on an ordinary stop
 
@@ -208,7 +226,7 @@ When BOSH stops or updates an instance without deleting it, drain waits up to tw
 
 Garage can't change the replication factor of a cluster that already has a layout. It refuses to start when the configured value differs from the stored one, and the resulting crash loop is hard to read. Pre-start therefore records the value in `/var/vcap/store/garage/replication_factor` the first time a node starts, and on every later start it compares that value with `garage.replication_factor`. When they differ, pre-start fails before Garage starts and prints what to do. bpm runs the same check before every start, so a restart by monit is covered too.
 
-To keep the cluster, we set `garage.replication_factor` back to the recorded value and deploy again. To move to a new replication factor, we deploy a second Garage cluster with the new value, copy the buckets across with an S3 tool such as rclone, point clients at the new cluster, and then delete the old one. We never try to get around the check by deleting files under the metadata directory, because those files hold the cluster's layout.
+To keep the cluster, we set `garage.replication_factor` back to the recorded value and deploy again. To move to a new replication factor, we deploy a second Garage cluster with the new value and copy the data across, as [Moving data to a new cluster](#moving-data-to-a-new-cluster) describes. We never try to get around the check by deleting files under the metadata directory, because those files hold the cluster's layout.
 
 A node from an older release has a layout but no marker. Pre-start lets it start, Garage itself checks the stored layout against the configuration, and post-start writes the marker once Garage is running with that value.
 

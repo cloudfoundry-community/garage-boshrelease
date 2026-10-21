@@ -1,0 +1,30 @@
+#!/bin/bash
+# Managed by BOSH. Do not edit manually.
+#
+# bpm starts Garage through this script, which picks the server flags.
+<%
+  single_node = link('garage-rpc').instances.length == 1
+-%>
+#
+# Garage's single-node mode makes the first layout, the root key, and the
+# default bucket of a brand new node by itself, and it refuses to start once
+# the stored layout is past its first version. A cluster's layout always is,
+# so the last node of a cluster that was scaled down to one instance could
+# never start in that mode. This script therefore uses it only when this is
+# the only instance in the garage-rpc link and the node has no stored layout
+# yet. Every other start runs `garage server` alone, and post-deploy
+# provisions the root key and the default bucket instead.
+set -eu
+
+ARGS=(server)
+<% if single_node -%>
+if [ ! -e "<%= p('garage.metadata_dir') %>/cluster_layout" ]; then
+  ARGS+=(--single-node --default-bucket)
+else
+  unset GARAGE_DEFAULT_ACCESS_KEY GARAGE_DEFAULT_SECRET_KEY GARAGE_DEFAULT_BUCKET
+fi
+<% else -%>
+unset GARAGE_DEFAULT_ACCESS_KEY GARAGE_DEFAULT_SECRET_KEY GARAGE_DEFAULT_BUCKET
+<% end -%>
+
+exec /var/vcap/packages/garage/bin/garage "${ARGS[@]}"

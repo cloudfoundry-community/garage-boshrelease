@@ -3,17 +3,33 @@
 #
 # Drain never stops the process. Monit and bpm stop it after drain returns,
 # and a drain that signals the process itself races monit, which can restart
-# it mid-drain. Drain does two things instead.
+# it mid-drain. Drain handles three cases instead.
 #
-# When BOSH is about to delete this instance (the next persistent disk size
-# is 0), drain refuses while this node still holds a role in a layout with
-# more than one node, because deleting it would take its partitions with it.
-# A node whose role has already been removed waits until the cluster has
-# finished moving data off it, and then lets BOSH go ahead.
+# When BOSH deletes the whole deployment, drain lets it go ahead at once.
 #
-# On any other stop or update, drain waits for the node's block resync
-# queue to empty, for up to two minutes, so blocks still in flight to other
-# nodes are not cut off.
+# When BOSH deletes only this instance, for example because `instances` went
+# down, drain takes the node out of the cluster before its disk goes away:
+#
+#   1. It checks that the layout is stable, that nothing is staged, that no
+#      node holding a role is down, and that the nodes left behind are still
+#      at least as many as the replication factor.
+#   2. It stages `garage layout remove` for this node, waits a few seconds,
+#      and checks that its own removal is the only staged change and that the
+#      layout version has not moved, so that a change made elsewhere is never
+#      applied along with it.
+#   3. It applies the next layout version from this node.
+#   4. It waits until the layout is stable again and this node's data
+#      directory holds no blocks. Garage does not track block moves in the
+#      layout, so a stable layout alone does not mean the blocks have left.
+#
+# Any refusal before the apply drops the staged removal and leaves the layout
+# as it was. A node whose role is already gone, because an earlier drain
+# timed out or an operator removed it by hand, goes straight to step 4, so a
+# second deploy picks up where the first one stopped.
+#
+# On any other stop or update, drain waits for the node's block resync queue
+# to empty, for up to two minutes, so blocks still in flight to other nodes
+# are not cut off.
 #
 # BOSH drain protocol: stdout must be a single integer, the seconds BOSH
 # should still wait (0 means done). All diagnostics go to stderr, and a
@@ -24,25 +40,67 @@ set -u
 source /var/vcap/jobs/garage/bin/helpers.sh
 
 PIDFILE=/var/vcap/sys/run/bpm/garage/garage.pid
-DELETE_WAIT_SECS=1800
+DATA_DIR="<%= p('garage.data_dir') %>"
+RENDERED_RF="<%= p('garage.replication_factor').to_i %>"
+# How long a deleted node waits for its data to move to the remaining nodes.
+DELETE_WAIT_SECS="<%= p('garage.drain.delete_wait_secs').to_i %>"
+# How long a deleted node waits for an earlier layout change to settle
+# before it removes itself.
+STABLE_WAIT_SECS=600
+# How long the staged removal sits before drain checks it and applies it.
+SETTLE_SECS=15
+# Garage deletes a block from a node that no longer stores it about ten
+# minutes after the block's last reference has moved away. A block that is
+# still here after this long, with nothing queued, gets queued by
+# `garage repair blocks`.
+REPAIR_AFTER_SECS=900
 RESYNC_WAIT_SECS=120
 
 log() { echo "[drain] $*" >&2; }
 
-# Every CLI call is bounded, so a wedged node cannot hang the drain.
-g() { timeout 30 "${GARAGE_BIN}" "$@"; }
+TMP_DIR=$(mktemp -d)
+
+# Set while this drain has staged its removal and not applied it yet. Any
+# exit in that window drops the staged change again, because a later deploy
+# refuses to run while the layout has staged changes.
+STAGING=false
+on_exit() {
+  local rc=$? out
+  if [ "${STAGING}" = "true" ]; then
+    log "stopped before applying its staged removal, so it drops it with \`garage layout revert --yes\`."
+    if out=$(garage_cli layout revert --yes 2>&1); then
+      log "dropped the staged layout change."
+    else
+      log "WARNING: \`garage layout revert --yes\` failed: ${out}"
+      log "WARNING: run it by hand on any node before the next deploy, which otherwise refuses to run."
+    fi
+  fi
+  rm -rf "${TMP_DIR}"
+  exit "${rc}"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Prints the manual steps for taking SELF out of the cluster.
+manual_steps() {
+  cat >&2 <<MSG
+[drain] To take this node out of the cluster by hand, log in to any node, run
+[drain] \`sudo -i\` and \`source /var/vcap/jobs/garage/bin/env.sh\`, and then:
+[drain]   garage layout show                  # nothing may be staged
+[drain]   garage layout remove ${SELF:-<node id>}
+[drain]   garage layout apply --version <current version + 1>
+[drain] Leave this instance running until \`garage layout history\` reports a stable
+[drain] state with a single live layout version and \`garage stats\` on this node
+[drain] shows 0 RC entries, and then deploy again. Drain then sees that the node
+[drain] holds no role, checks that ${DATA_DIR} holds no blocks, and lets BOSH go ahead.
+MSG
+}
 
 refuse() {
   log "REFUSED: $*"
-  cat >&2 <<'MSG'
-[drain] To remove a Garage node from a cluster, follow the scale-down procedure in the
-[drain] release README. In short, run `garage layout remove <node-id>` for each node
-[drain] that will go away, apply the layout with `garage layout apply --version <next>`,
-[drain] wait until `garage layout history` reports a stable state with a single live
-[drain] layout version, and only then lower `instances` in the manifest and deploy.
-[drain] If the node is already gone from the layout and its process cannot run, deploy
-[drain] with `--skip-drain` for this instance group.
-MSG
+  manual_steps
   exit 1
 }
 
@@ -53,46 +111,222 @@ process_running() {
   [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
 }
 
-NEXT_DISK=$(printf '%s' "${BOSH_JOB_NEXT_STATE:-}" \
-  | grep -o '"persistent_disk" *: *[0-9]*' | grep -o '[0-9]*$' || true)
+# Reads one value from NEXT_STATE_FILE, or prints "keep" when pre-stop did
+# not record it.
+next_state() {
+  local v=""
+  [ -f "${NEXT_STATE_FILE}" ] && v=$(awk -F= -v k="$1" '$1 == k { print $2; exit }' "${NEXT_STATE_FILE}")
+  echo "${v:-keep}"
+}
 
-if [ "${NEXT_DISK}" = "0" ]; then
-  log "BOSH is deleting this instance (next persistent disk size is 0)."
-  if ! process_running; then
-    refuse "the garage process is not running, so drain cannot check whether this node still holds a layout role."
+# ── cluster state from the local admin API ───────────────────────────────────
+READ_ERROR=""
+
+fetch_flat() {
+  local endpoint="$1" flat="$2" body="${TMP_DIR}/response.json" code
+  code=$(admin_request "${body}" "${LOCAL_ADMIN_URL}/v2/${endpoint}")
+  if [ "${code}" != "200" ]; then
+    READ_ERROR="the admin API call ${endpoint} answered HTTP ${code}: $(head -c 300 "${body}")"
+    return 1
   fi
-  load_rpc_secret
-  SELF_ID=$(g node id -q 2>/dev/null | cut -c1-16)
-  LAYOUT_OUT=$(g layout show 2>/dev/null) || LAYOUT_OUT=""
-  if [ -z "${SELF_ID}" ] || [ -z "${LAYOUT_OUT}" ]; then
-    refuse "the local Garage node did not answer, so drain cannot check whether it still holds a layout role."
+  if ! json_flatten < "${body}" > "${flat}" 2>"${TMP_DIR}/flatten.err"; then
+    READ_ERROR="the admin API call ${endpoint} returned JSON drain cannot read: $(cat "${TMP_DIR}/flatten.err")"
+    return 1
   fi
-  ROLES=$(current_layout_rows <<< "${LAYOUT_OUT}" | awk '{ print $1 }')
-  ROLE_COUNT=$(awk 'NF' <<< "${ROLES}" | wc -l | tr -d ' ')
-  if grep -qxF "${SELF_ID}" <<< "${ROLES}"; then
-    if [ "${ROLE_COUNT}" -gt 1 ]; then
-      refuse "node ${SELF_ID} still holds a role in a ${ROLE_COUNT}-node layout, and deleting it would take its share of the data with it."
+}
+
+# Fills LAYOUT_VERSION, ROLES (one full node id per line), STAGED_IDS (the
+# node ids with a staged role change), STAGED_REMOVALS (those whose change is
+# a removal), STAGED_PARAMS (non-empty when layout parameters are staged),
+# LIVE_VERSIONS (layout versions that are not historical yet), and
+# FAILED_ROLES (nodes that hold a role and are down).
+read_cluster() {
+  local L="${TMP_DIR}/layout.flat" H="${TMP_DIR}/history.flat" S="${TMP_DIR}/status.flat"
+  fetch_flat GetClusterLayout "${L}" || return 1
+  fetch_flat GetClusterLayoutHistory "${H}" || return 1
+  fetch_flat GetClusterStatus "${S}" || return 1
+  LAYOUT_VERSION=$(awk -F'\t' '$1 == "version" { print $3; exit }' "${L}")
+  if ! [[ "${LAYOUT_VERSION}" =~ ^[0-9]+$ ]]; then
+    READ_ERROR="GetClusterLayout returned no layout version"
+    return 1
+  fi
+  ROLES=$(awk -F'\t' '$1 ~ /^roles\.[0-9]+\.id$/ { print $3 }' "${L}")
+  STAGED_IDS=$(awk -F'\t' '$1 ~ /^stagedRoleChanges\.[0-9]+\.id$/ { print $3 }' "${L}")
+  STAGED_REMOVALS=$(awk -F'\t' '
+    $1 ~ /^stagedRoleChanges\.[0-9]+\.id$/ { split($1, p, "."); id[p[2]] = $3 }
+    $1 ~ /^stagedRoleChanges\.[0-9]+\.remove$/ && $3 == "true" { split($1, p, "."); rm[p[2]] = 1 }
+    END { for (k in rm) print id[k] }' "${L}")
+  STAGED_PARAMS=$(awk -F'\t' '$1 ~ /^stagedParameters(\.|$)/ && !($1 == "stagedParameters" && $3 == "null") { print "yes"; exit }' "${L}")
+  LIVE_VERSIONS=$(awk -F'\t' '$1 ~ /^versions\.[0-9]+\.status$/ && $3 != "Historical" { n++ } END { print n + 0 }' "${H}")
+  FAILED_ROLES=$(awk -F'\t' '
+    $1 ~ /^nodes\.[0-9]+\.id$/ { split($1, p, "."); id[p[2]] = $3 }
+    $1 ~ /^nodes\.[0-9]+\.isUp$/ { split($1, p, "."); up[p[2]] = $3 }
+    $1 ~ /^nodes\.[0-9]+\.role\.zone$/ { split($1, p, "."); role[p[2]] = 1 }
+    END { for (k in role) if (up[k] != "true") print substr(id[k], 1, 16) }' "${S}" | paste -sd ' ' -)
+  return 0
+}
+
+holds_role() { grep -qxF "$1" <<< "${ROLES}"; }
+role_count() { awk 'NF' <<< "${ROLES}" | wc -l | tr -d ' '; }
+
+# Succeeds when the data directory still holds at least one block file.
+# Garage names a block after its 64-character hash, with .zst when it is
+# compressed.
+has_blocks() {
+  [ -n "$(find "${DATA_DIR}" -type f -regextype posix-extended \
+    -regex '.*/[0-9a-f]{64}(\.zst)?' -print -quit 2>/dev/null)" ]
+}
+
+# Prints one value from the local node's `garage stats` output.
+local_stat() {
+  garage_cli stats 2>/dev/null \
+    | awk -F':[ \t]*' -v want="$1" 'index($1, want) { split($2, v, /[ \t]/); print v[1]; exit }'
+}
+
+# ── take this node out of the layout ─────────────────────────────────────────
+remove_self() {
+  local start out count
+
+  start=${SECONDS}
+  while [ "${LIVE_VERSIONS}" -gt 1 ]; do
+    if [ $((SECONDS - start)) -ge "${STABLE_WAIT_SECS}" ]; then
+      refuse "the cluster is still moving data for an earlier layout change after ${STABLE_WAIT_SECS}s (${LIVE_VERSIONS} live layout versions), and drain removes a node only from a stable layout. Deploy again once \`garage layout history\` reports a stable state."
     fi
-    log "node ${SELF_ID} is the only node in the layout, so the whole cluster is being deleted."
-    echo 0
-    exit 0
+    log "waiting for an earlier layout change to settle (${LIVE_VERSIONS} live layout versions)..."
+    sleep 10
+    read_cluster || refuse "could not read the cluster state: ${READ_ERROR}"
+  done
+
+  if [ -n "${STAGED_IDS}" ] || [ -n "${STAGED_PARAMS}" ]; then
+    refuse "the cluster layout has staged changes that nobody applied, and \`garage layout apply\` would commit them along with this node's removal. Review them with \`garage layout show\`, apply them with \`garage layout apply --version $((LAYOUT_VERSION + 1))\` or drop them with \`garage layout revert --yes\`, and deploy again."
+  fi
+  if [ -n "${FAILED_ROLES}" ]; then
+    refuse "node(s) ${FAILED_ROLES} hold a role but are down. Removing this node now would leave their partitions with even fewer copies, and the layout could not settle while they are down. Bring them back, or replace them, and deploy again."
+  fi
+  count=$(role_count)
+  if [ $((count - 1)) -lt "${RENDERED_RF}" ]; then
+    refuse "removing node ${SELF} would leave $((count - 1)) node(s) in the layout, fewer than the replication factor of ${RENDERED_RF}. Garage cannot change the replication factor, so keep at least ${RENDERED_RF} instances, or move the data to a new cluster as the README describes."
   fi
 
-  # The role is gone. Wait until no older layout version is still live,
-  # which means the cluster has finished moving this node's data elsewhere.
-  log "node ${SELF_ID} holds no role; waiting for the cluster to finish moving its data."
-  START=${SECONDS}
+  BASE_VERSION="${LAYOUT_VERSION}"
+  NEXT_VERSION=$((BASE_VERSION + 1))
+  log "staging the removal of node ${SELF} from layout version ${BASE_VERSION} (${count} roles, replication factor ${RENDERED_RF})."
+  STAGING=true
+  if ! out=$(garage_cli layout remove "${SELF_ID}" 2>&1); then
+    refuse "\`garage layout remove ${SELF}\` failed: ${out}"
+  fi
+
+  sleep "${SETTLE_SECS}"
+  read_cluster || refuse "could not read the cluster state after staging the removal: ${READ_ERROR}"
+  if [ "${LAYOUT_VERSION}" != "${BASE_VERSION}" ]; then
+    refuse "the layout moved from version ${BASE_VERSION} to ${LAYOUT_VERSION} while this drain staged its removal, so another layout change is under way. Deploy again once it has settled."
+  fi
+  if [ "${STAGED_IDS}" != "${SELF_ID}" ] || [ "${STAGED_REMOVALS}" != "${SELF_ID}" ] || [ -n "${STAGED_PARAMS}" ]; then
+    refuse "the staged layout changes are not only this node's removal, so something else is changing the layout. Drain never applies a change it did not make. Run \`garage layout show\` to see them, and deploy again once they are gone."
+  fi
+
+  log "applying layout version ${NEXT_VERSION} without node ${SELF}..."
+  if ! out=$(garage_cli layout apply --version "${NEXT_VERSION}" 2>&1); then
+    refuse "\`garage layout apply --version ${NEXT_VERSION}\` failed, so the removal is dropped and the layout stays at version ${BASE_VERSION}: ${out}"
+  fi
+  STAGING=false
+  while IFS= read -r line; do [ -z "${line}" ] || log "  ${line}"; done <<< "${out}"
+
+  read_cluster || refuse "applied layout version ${NEXT_VERSION}, but could not read it back: ${READ_ERROR}. Deploy again; drain then waits for this node's data to move."
+  if holds_role "${SELF_ID}"; then
+    refuse "applied layout version ${NEXT_VERSION}, but node ${SELF} still holds a role in it. Check \`garage layout show\`."
+  fi
+  log "applied layout version ${NEXT_VERSION}; node ${SELF} no longer holds a role."
+}
+
+# ── wait until this node's data lives elsewhere ──────────────────────────────
+wait_until_offloaded() {
+  local start=${SECONDS} stable_since="" repaired=false last_log=-60 queue rc_entries blocks elapsed
+
+  log "waiting up to ${DELETE_WAIT_SECS}s for the cluster to move this node's data to the remaining nodes."
   while :; do
-    if g layout history 2>/dev/null | grep -q 'stable state with a single live layout version'; then
-      log "the cluster layout is stable, so this node can be deleted."
-      echo 0
-      exit 0
+    elapsed=$((SECONDS - start))
+    if read_cluster; then
+      if holds_role "${SELF_ID}"; then
+        refuse "node ${SELF} holds a role in the layout again (version ${LAYOUT_VERSION}), so deleting it would take its partitions with it."
+      fi
+    else
+      log "could not read the cluster state (${READ_ERROR}); trying again."
+      LIVE_VERSIONS=unknown
     fi
-    if [ $((SECONDS - START)) -ge "${DELETE_WAIT_SECS}" ]; then
-      refuse "the cluster was still moving data off node ${SELF_ID} after ${DELETE_WAIT_SECS}s. Check \`garage layout history\`, and deploy again once it reports a stable state."
+    queue=$(local_stat 'resync queue length')
+    rc_entries=$(local_stat 'number of RC entries')
+    if has_blocks; then blocks=yes; else blocks=no; fi
+
+    if [ "${LIVE_VERSIONS}" = "1" ] && [ "${blocks}" = "no" ] && [ "${queue}" = "0" ]; then
+      log "the layout is stable and ${DATA_DIR} holds no blocks, so node ${SELF} can be deleted."
+      return 0
+    fi
+
+    if [ "${LIVE_VERSIONS}" = "1" ]; then
+      stable_since=${stable_since:-${SECONDS}}
+      if [ "${repaired}" = "false" ] && [ "${blocks}" = "yes" ] && [ "${queue}" = "0" ] \
+        && [ $((SECONDS - stable_since)) -ge "${REPAIR_AFTER_SECS}" ]; then
+        log "blocks are still here ${REPAIR_AFTER_SECS}s after the layout settled and nothing is queued, so drain queues every local block with \`garage repair --yes blocks\`."
+        garage_cli repair --yes blocks >&2 2>&1 || log "WARNING: \`garage repair --yes blocks\` failed; still waiting."
+        repaired=true
+      fi
+    else
+      stable_since=""
+    fi
+
+    if [ "${elapsed}" -ge "${DELETE_WAIT_SECS}" ]; then
+      log "REFUSED: after ${DELETE_WAIT_SECS}s the cluster has not finished moving node ${SELF}'s data (live layout versions: ${LIVE_VERSIONS}, blocks left in ${DATA_DIR}: ${blocks}, RC entries: ${rc_entries:-unknown}, resync queue: ${queue:-unknown})."
+      log "The node holds no role and keeps running, so nothing is lost. Deploy again to keep waiting, or raise garage.drain.delete_wait_secs for a large data set."
+      log "Never deploy with --skip-drain while blocks are left, because BOSH would delete them with the disk."
+      exit 1
+    fi
+    if [ $((elapsed - last_log)) -ge 60 ]; then
+      log "  ${elapsed}s: live layout versions ${LIVE_VERSIONS}, blocks left: ${blocks}, RC entries: ${rc_entries:-unknown}, resync queue: ${queue:-unknown}"
+      last_log=${elapsed}
     fi
     sleep 10
   done
+}
+
+NEXT_DISK=$(printf '%s' "${BOSH_JOB_NEXT_STATE:-}" \
+  | grep -o '"persistent_disk" *: *[0-9]*' | grep -o '[0-9]*$' || true)
+NEXT_INSTANCE=$(next_state instance)
+NEXT_DEPLOYMENT=$(next_state deployment)
+
+if [ "${NEXT_DEPLOYMENT}" = "delete" ]; then
+  log "BOSH is deleting the whole deployment, so no data needs to move."
+  echo 0
+  exit 0
+fi
+
+if [ "${NEXT_INSTANCE}" = "delete" ] || [ "${NEXT_DISK}" = "0" ]; then
+  log "BOSH is deleting this instance (next instance state: ${NEXT_INSTANCE}, next persistent disk size: ${NEXT_DISK:-unknown})."
+  SELF=""
+  if ! process_running; then
+    refuse "the garage process is not running, so drain cannot check whether this node still holds a layout role or data."
+  fi
+  load_rpc_secret
+  SELF_ID=$(remote_node_id "${LOCAL_ADMIN_URL#http://}")
+  if [ -z "${SELF_ID}" ]; then
+    refuse "the local Garage admin API at ${LOCAL_ADMIN_URL} did not name its node."
+  fi
+  SELF="${SELF_ID:0:16}"
+  read_cluster || refuse "could not read the cluster state: ${READ_ERROR}"
+
+  if holds_role "${SELF_ID}"; then
+    if [ "$(role_count)" -le 1 ]; then
+      log "node ${SELF} is the only node in the layout, so the whole cluster is being deleted."
+      echo 0
+      exit 0
+    fi
+    remove_self
+  else
+    log "node ${SELF} holds no role in layout version ${LAYOUT_VERSION}."
+  fi
+  wait_until_offloaded
+  echo 0
+  exit 0
 fi
 
 # ── ordinary stop or update ──────────────────────────────────────────────────
@@ -105,8 +339,7 @@ fi
 load_rpc_secret
 START=${SECONDS}
 while :; do
-  QUEUE=$(g stats 2>/dev/null \
-    | awk -F': *' '/resync queue length/ { gsub(/ /, "", $2); print $2; exit }')
+  QUEUE=$(local_stat 'resync queue length')
   if [ -z "${QUEUE}" ]; then
     log "could not read the block resync queue; letting BOSH stop the process."
     break

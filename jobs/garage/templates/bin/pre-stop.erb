@@ -1,0 +1,29 @@
+#!/bin/bash
+# Managed by BOSH. Do not edit manually.
+#
+# BOSH runs pre-stop just before drain, and only pre-stop learns whether the
+# VM, the instance, and the whole deployment are about to be deleted. This
+# script writes those three answers to NEXT_STATE_FILE for drain to read.
+# Drain needs them because deleting one instance has to move its data to the
+# remaining nodes first, while deleting the whole deployment does not.
+#
+# Pre-stop never fails, because a failure would stop BOSH from deleting or
+# stopping the instance for a reason that has nothing to do with Garage.
+set -u
+
+source /var/vcap/jobs/garage/bin/helpers.sh
+
+STATE_DIR=$(dirname "${NEXT_STATE_FILE}")
+mkdir -p "${STATE_DIR}" 2>/dev/null || true
+
+if printf 'vm=%s\ninstance=%s\ndeployment=%s\n' \
+    "${BOSH_VM_NEXT_STATE:-keep}" \
+    "${BOSH_INSTANCE_NEXT_STATE:-keep}" \
+    "${BOSH_DEPLOYMENT_NEXT_STATE:-keep}" > "${NEXT_STATE_FILE}.tmp" 2>/dev/null \
+  && mv -f "${NEXT_STATE_FILE}.tmp" "${NEXT_STATE_FILE}" 2>/dev/null; then
+  echo "[pre-stop] next state: vm=${BOSH_VM_NEXT_STATE:-keep} instance=${BOSH_INSTANCE_NEXT_STATE:-keep} deployment=${BOSH_DEPLOYMENT_NEXT_STATE:-keep}"
+else
+  rm -f "${NEXT_STATE_FILE}.tmp" "${NEXT_STATE_FILE}" 2>/dev/null || true
+  echo "[pre-stop] WARNING: could not write ${NEXT_STATE_FILE}; drain falls back to the persistent disk size BOSH reports."
+fi
+exit 0

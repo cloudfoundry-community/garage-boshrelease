@@ -173,6 +173,10 @@ case "${OUTCOME}" in
     "${GARAGE_BIN}" status 2>&1 || true ;;
 esac
 
+# The node is running again, so what pre-stop recorded for its last stop no
+# longer applies.
+rm -f "${NEXT_STATE_FILE}"
+
 # ── record the replication factor ────────────────────────────────────────────
 # Garage refuses to start when a stored layout disagrees with the configured
 # replication factor, so a running node has proven the rendered value. This

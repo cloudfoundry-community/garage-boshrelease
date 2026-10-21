@@ -1,20 +1,12 @@
----
 # Managed by BOSH. Do not edit manually.
-processes:
-- name: garage
-  executable: /var/vcap/packages/garage/bin/garage
-  args:
-  - server
 <%
-  # Garage refuses --default-access-key and --default-bucket unless
-  # --single-node is also given, so a cluster starts with neither flag and
-  # the post-deploy hook provisions the root key and default bucket instead.
+  # The server script passes --single-node and --default-bucket only to a
+  # lone node that has no layout yet, and these variables only matter then.
   single_node = link('garage-rpc').instances.length == 1
 -%>
-<% if single_node -%>
-  - --single-node
-  - --default-bucket
-<% end -%>
+processes:
+- name: garage
+  executable: /var/vcap/jobs/garage/bin/garage-server
 
   env:
     GARAGE_CONFIG_FILE: /var/vcap/jobs/garage/config/garage.toml
