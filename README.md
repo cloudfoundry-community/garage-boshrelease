@@ -134,7 +134,7 @@ Garage accepts `--default-bucket` only together with `--single-node`, so a clust
 
 4. It also stops when the layout has staged changes that it didn't make, because `garage layout apply` would commit them without anyone reviewing them. We review them with `garage layout show`, apply them or drop them with `garage layout revert`, and deploy again.
 
-5. It gives each node that shows `NO ROLE ASSIGNED` a role in the zone named after its BOSH AZ, with the capacity from `garage.layout.capacity`. Each role carries two tags, `bosh-id-<instance id>` and `<instance group>/<index>`. A node whose address isn't in the link is left alone.
+5. It gives each node that shows `NO ROLE ASSIGNED` a role in the zone named after its BOSH AZ, with the capacity from `garage.layout.capacity`. Each role carries two tags, `bosh-id-<instance id>` and `<instance group>/<index>`. A role made by an earlier release has no tags, and when its node is healthy and its address belongs to a link instance, post-deploy adds the two tags while keeping the role's zone and capacity. That change is staged and applied together with any new roles, and it moves no data. A node whose address isn't in the link is left alone.
 
 6. It applies the next layout version, imports the root key, creates the default bucket, and grants the key read, write, and owner access to it.
 
@@ -150,9 +150,23 @@ With `garage.layout.manual: true`, post-deploy never changes the layout, and we 
 
 ### Replacing a lost node
 
-A node whose persistent disk is lost or recreated starts with a new node id and no role, and Garage keeps listing its old role as failed. BOSH keeps the instance id across a recreate, so post-deploy finds the old role through its `bosh-id-<instance id>` tag. Roles made by an older release have no tags, and for those it falls back to a matching hostname or address. It then assigns the new node with `garage layout assign --replace <old id>`, which hands the old node's partitions to the new one, and Garage copies the data back from the surviving replicas.
+A node whose persistent disk is lost or recreated starts with a new node id and no role, and Garage keeps listing its old role as failed. Post-deploy plans the whole change before it stages anything, and for each node without a role it looks for the old role in this order.
+
+1. BOSH keeps the instance id across a recreate, so a role tagged with the same `bosh-id-<instance id>` under another node id is the instance's old identity.
+
+2. When no role carries that tag, and a new role would leave the layout with more roles than there are instances in the link, post-deploy looks at the failed roles in the node's zone that belong to no other instance. A failed node has no address in `garage status`, so this is how an untagged role from an earlier release is matched. When there's exactly one such role, the new node replaces it.
+
+3. When there's more than one such role, post-deploy can't tell which one belonged to the node. It stops with a message that lists them and changes nothing, and we assign the node by hand with `garage layout assign <new id> --replace <old id>` and deploy again.
+
+4. Otherwise the node gets a new role, as it does when the cluster grows.
+
+The new node is assigned with `garage layout assign --replace <old id>`, which hands the old node's partitions to the new one, and Garage copies the data back from the surviving replicas. Post-deploy never removes a role in any other way.
 
 Once the old node is down, post-deploy runs `garage layout skip-dead-nodes`, so the cluster stops waiting for the old node to acknowledge the new layout. If a failed role is still in the layout after that, post-deploy prints a warning with its id, and we deal with it by hand with `garage layout remove` or `garage layout assign --replace`.
+
+### Root key and bucket
+
+Post-deploy checks the root key, the default bucket, and the key's read, write, and owner grant on the bucket before it touches any of them, so a cluster that already has all three sees no writes. Bucket and key writes need a quorum in every live layout version, which can take a while right after a layout change, so each missing step is retried for up to three minutes before the deploy fails.
 
 ## Scaling
 
@@ -180,7 +194,7 @@ Removing a node that still holds a role takes its share of the data with it, so 
 
 We don't deploy between step 2 and step 5. A deploy in that window still sees the removed nodes in the link, and post-deploy gives them their roles back.
 
-The cluster must keep at least as many nodes as the replication factor, so a cluster with `replication_factor: 3` can't go below three nodes.
+The cluster must keep at least as many nodes as the replication factor, so a cluster with `replication_factor: 3` can't go below three nodes. We also never scale a cluster down to a single instance. With one instance the job starts Garage with `--single-node`, and Garage refuses to start in that mode once the layout has changed more than once.
 
 When drain refuses, it prints these steps. When the role is gone but Garage is still moving data, drain waits up to 30 minutes for the layout to become stable, and then refuses. If a node is already out of the layout and its process can't run, we deploy with `--skip-drain` for that instance group. Deleting the whole deployment with `bosh delete-deployment` drains every instance as well, and every drain refuses, so we pass `--force` to delete a cluster we no longer want.
 
@@ -224,7 +238,7 @@ Release 0.0.1 packaged Garage v1.3.1, and this release packages Garage v2.3.0. G
 
 5. Check `garage status` and `garage layout show`, run the `smoke-tests` errand, and keep an eye on the cluster for the next few hours.
 
-Nodes from 0.0.1 have no replication factor marker, and post-start writes one during this deploy. Their roles have no tags either, so a later replacement falls back to matching the old role by hostname or address.
+Nodes from 0.0.1 have no replication factor marker, and post-start writes one during this deploy. Their roles have no tags either, and post-deploy tags every healthy one during this deploy.
 
 ## Architecture
 
