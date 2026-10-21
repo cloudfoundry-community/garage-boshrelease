@@ -130,17 +130,17 @@ Garage accepts `--default-bucket` only together with `--single-node`, so a clust
 
 2. Post-start accepts a 503 from `/health` while the node has no layout yet, because a cluster has no layout until post-deploy applies one.
 
-3. In post-deploy, the acting instance waits until every instance in the link is a healthy Garage node, and until its own copy of the layout is as new as the newest one any peer reports. It stops with an error if too few nodes are healthy after a minute, because a layout built from part of the cluster could give roles to the wrong set of nodes.
+3. In post-deploy, the acting instance asks each instance's admin API which node it runs (`GET /v2/GetNodeInfo?node=self`). That answer is what ties a node id to a BOSH instance, because `garage status` can keep listing a node that has just gone away as healthy for close to a minute. The acting instance waits until every instance's node is up and until its own copy of the layout is as new as the newest one any peer reports, and then it checks the instances once more before it plans anything. It stops with an error if an instance is still missing after a minute, because a layout built from part of the cluster could give roles to the wrong set of nodes.
 
-4. It also stops when the layout has staged changes that it didn't make, because `garage layout apply` would commit them without anyone reviewing them. We review them with `garage layout show`, apply them or drop them with `garage layout revert`, and deploy again.
+4. It also stops when the layout has staged changes that it didn't make, because `garage layout apply` would commit them without anyone reviewing them. We review them with `garage layout show`, apply them or drop them with `garage layout revert --yes`, and deploy again.
 
-5. It gives each node that shows `NO ROLE ASSIGNED` a role in the zone named after its BOSH AZ, with the capacity from `garage.layout.capacity`. Each role carries two tags, `bosh-id-<instance id>` and `<instance group>/<index>`. A role made by an earlier release has no tags, and when its node is healthy and its address belongs to a link instance, post-deploy adds the two tags while keeping the role's zone and capacity. That change is staged and applied together with any new roles, and it moves no data. A node whose address isn't in the link is left alone.
+5. It gives each instance's node that has no role a role in the zone named after its BOSH AZ, with the capacity from `garage.layout.capacity`. Each role carries two tags, `bosh-id-<instance id>` and `<instance group>/<index>`. A role made by an earlier release has no `bosh-id` tag, and when the node that an instance's admin API names holds it, post-deploy adds the two tags while it keeps the role's zone, capacity, and other tags. That change is staged and applied together with any new roles, and it moves no data. Post-deploy never changes the role of a node outside the link.
 
-6. It applies the next layout version, imports the root key, creates the default bucket, and grants the key read, write, and owner access to it.
+6. It plans the whole change before it stages anything, so a deploy that stops leaves the layout as it was. Then it applies the next layout version, checks that every instance's node holds a role in it, imports the root key, creates the default bucket, and grants the key read, write, and owner access to it. If post-deploy fails or is interrupted after it has staged a change and before the apply, it drops what it staged with `garage layout revert --yes`.
 
-Every step is idempotent, so later deploys find nothing to do.
+Every step is idempotent, so later deploys find nothing to do. Every call to the `garage` CLI is limited to 30 seconds and every admin API request to at most 10 seconds, so a node that stops answering fails the deploy instead of hanging it.
 
-When an instance has no BOSH AZ in the link, or its address doesn't resolve, post-deploy prints a warning banner. An instance without an AZ goes into the acting instance's zone, and an instance that doesn't resolve gets no role. Garage spreads replicas across zones, so every instance should have an AZ. For a production cluster with `replication_factor: 3`, each node should be in its own BOSH AZ, so that Garage places the three copies in three zones.
+When an instance has no BOSH AZ in the link, post-deploy prints a warning banner and puts the instance into the acting instance's zone. Garage spreads replicas across zones, so every instance should have an AZ. When an instance's address doesn't resolve to an IPv4 address, post-deploy stops before it changes anything, because an instance it can't check could own any of the roles the change would touch. For a production cluster with `replication_factor: 3`, each node should be in its own BOSH AZ, so that Garage places the three copies in three zones.
 
 The capacity default of `1T` is a placeholder, and Garage uses it only to share partitions between nodes in proportion to their capacity. Every node gets the same value, so we set `garage.layout.capacity` to roughly the usable size of the persistent disk, and we give every instance the same disk size.
 
@@ -150,23 +150,25 @@ With `garage.layout.manual: true`, post-deploy never changes the layout, and we 
 
 ### Replacing a lost node
 
-A node whose persistent disk is lost or recreated starts with a new node id and no role, and Garage keeps listing its old role as failed. Post-deploy plans the whole change before it stages anything, and for each node without a role it looks for the old role in this order.
+A node whose persistent disk is lost or recreated starts with a new node id and no role, and Garage keeps listing its old role as failed. Post-deploy replaces an old role only when it can prove the role belongs to the BOSH instance it's acting for. When it can't, it prints a warning that names the role and gives the exact commands to run by hand, and it leaves the layout alone. A healthy node that is down for a moment, a node outside the `garage-rpc` link, and a node that we added by hand are never touched.
 
-1. BOSH keeps the instance id across a recreate, so a role tagged with the same `bosh-id-<instance id>` under another node id is the instance's old identity.
+For each instance whose node has no role, post-deploy checks the layout in this order.
 
-2. When no role carries that tag, and a new role would leave the layout with more roles than there are instances in the link, post-deploy looks at the failed roles in the node's zone that belong to no other instance. A failed node has no address in `garage status`, so this is how an untagged role from an earlier release is matched. When there's exactly one such role, the new node replaces it.
+1. BOSH keeps the instance id across a recreate. When exactly one role that no link instance's node holds carries the tag `bosh-id-<instance id>`, that role is the instance's old identity, and the new node replaces it with `garage layout assign --replace <old id>`. The new role keeps the old role's tags, apart from its `bosh-id` tag, which is written again. Garage hands the old node's partitions to the new one and copies the data back from the surviving replicas.
 
-3. When there's more than one such role, post-deploy can't tell which one belonged to the node. It stops with a message that lists them and changes nothing, and we assign the node by hand with `garage layout assign <new id> --replace <old id>` and deploy again.
+2. When more than one such role carries the tag, or the tagged role's node is still listed as up at an address other than the instance's own, post-deploy stops with nothing changed and lists the roles.
+
+3. When no role carries the tag, but the layout holds a role that no instance can be proven to own, and its node is either down or still listed at the address of a link instance that now runs another node, post-deploy stops with nothing changed. That role could be the instance's old identity from a disk that was lost before any release tagged it, or a node outside the link that is down for a moment, and post-deploy can't tell the two apart. A role whose node is up at an address outside the link belongs to someone else, and it doesn't stop the deploy.
 
 4. Otherwise the node gets a new role, as it does when the cluster grows.
 
-The new node is assigned with `garage layout assign --replace <old id>`, which hands the old node's partitions to the new one, and Garage copies the data back from the surviving replicas. Post-deploy never removes a role in any other way.
+When post-deploy stops, its message prints a `garage layout assign <new id> -z <zone> -c <capacity> -t bosh-id-<instance id> -t <instance group>/<index> --replace <old id>` command for each role that could be the old identity, and the command that gives the node a role of its own instead. We run the one that fits, check the staged change with `garage layout show`, apply it with `garage layout apply --version <next version>`, and deploy again. Post-deploy never removes a role.
 
-Once the old node is down, post-deploy runs `garage layout skip-dead-nodes`, so the cluster stops waiting for the old node to acknowledge the new layout. If a failed role is still in the layout after that, post-deploy prints a warning with its id, and we deal with it by hand with `garage layout remove` or `garage layout assign --replace`.
+A replace leaves the previous layout version waiting for the old node to acknowledge the new one, which it never will. Post-deploy waits up to 90 seconds for Garage to list the replaced nodes as failed, and then runs `garage layout skip-dead-nodes`. That command marks every node that is down as caught up, not only the replaced ones, so post-deploy runs it only when the replaced nodes are the only nodes in the live layout versions that are down. Otherwise it prints a warning with the reason and the exact `garage layout skip-dead-nodes --version <version>` command, and the deploy still succeeds. We run that command once the replaced nodes are the only failed ones. If a failed role is still in the layout at the end, post-deploy prints a warning with its id, and we deal with it by hand with `garage layout remove` or `garage layout assign --replace`.
 
 ### Root key and bucket
 
-Post-deploy checks the root key, the default bucket, and the key's read, write, and owner grant on the bucket before it touches any of them, so a cluster that already has all three sees no writes. Bucket and key writes need a quorum in every live layout version, which can take a while right after a layout change, so each missing step is retried for up to three minutes before the deploy fails.
+Post-deploy checks the root key, the default bucket, and the key's read, write, and owner grant on the bucket before it touches any of them, so a cluster that already has all three sees no writes. A step is written only when its check shows that it's missing. When a check can't get an answer, for example because the cluster has no quorum, the step is retried and never written blind. Bucket and key writes need a quorum in every live layout version, which can take a while right after a layout change, so each step is retried for at least three minutes, and at most about four, before the deploy fails with the last error. When Garage rejects the root key itself, for example because `garage.access_key` isn't a valid Garage key id, the deploy fails at once with Garage's reason. The secret never appears in the output.
 
 ## Scaling
 
@@ -238,7 +240,7 @@ Release 0.0.1 packaged Garage v1.3.1, and this release packages Garage v2.3.0. G
 
 5. Check `garage status` and `garage layout show`, run the `smoke-tests` errand, and keep an eye on the cluster for the next few hours.
 
-Nodes from 0.0.1 have no replication factor marker, and post-start writes one during this deploy. Their roles have no tags either, and post-deploy tags every healthy one during this deploy.
+Nodes from 0.0.1 have no replication factor marker, and post-start writes one during this deploy. Their roles have no tags either, and post-deploy tags every one that a link instance's node holds during this deploy. If a node lost its disk before the upgrade, post-deploy can't tell which untagged role was its own, so it stops and prints the `garage layout assign ... --replace` command for that node, as [Replacing a lost node](#replacing-a-lost-node) describes. We run it, apply the layout, and deploy again.
 
 ## Architecture
 
