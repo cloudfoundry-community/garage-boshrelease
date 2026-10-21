@@ -36,6 +36,17 @@ ADMIN_PORT="<%= p('garage.admin_port') %>"
 RPC_PORT="<%= p('garage.rpc_port') %>"
 LOCAL_ADMIN_URL="http://<%= local_admin %>:${ADMIN_PORT}"
 
+# Every Garage CLI call from the lifecycle scripts is limited to this many
+# seconds. A call that needs a quorum the cluster has lost otherwise waits
+# for Garage's own RPC timeout, which is several minutes.
+GARAGE_CLI_TIMEOUT=30
+
+# Runs the Garage CLI with GARAGE_CLI_TIMEOUT. A call that runs out of time
+# is killed and returns 124, or 137 when it ignores SIGTERM.
+garage_cli() {
+  timeout --kill-after=5 "${GARAGE_CLI_TIMEOUT}" "${GARAGE_BIN}" "$@"
+}
+
 # Exports the RPC secret that authenticates CLI calls to the local node. It
 # is read from the staged file rather than rendered into a script.
 load_rpc_secret() {
@@ -80,7 +91,7 @@ strip_port() {
 # returns non-zero, so an error never reads as a brand new cluster.
 layout_version() {
   local out v
-  if ! out=$("${GARAGE_BIN}" layout show 2>&1); then
+  if ! out=$(garage_cli layout show 2>&1); then
     echo "garage layout show failed: ${out}" >&2
     return 1
   fi
@@ -106,6 +117,134 @@ layout_version_retry() {
 # Runs curl against an admin API with the bearer token from the header file.
 admin_curl() {
   curl --silent --fail --max-time 5 -H @"${ADMIN_AUTH_HEADER_FILE}" "$@"
+}
+
+# Sends one request to an admin API and writes the response body to the
+# given file, whatever the status. Prints the HTTP status code, or 000 when
+# no response arrived. The remaining arguments go to curl.
+admin_request() {
+  local out="$1" code
+  shift
+  : > "${out}"
+  code=$(curl --silent --max-time 10 -H @"${ADMIN_AUTH_HEADER_FILE}" \
+    --output "${out}" --write-out '%{http_code}' "$@" 2>/dev/null) || true
+  [[ "${code}" =~ ^[0-9]{3}$ ]] || code=000
+  echo "${code}"
+}
+
+# Reads one JSON document on stdin and prints one "path<TAB>type<TAB>value"
+# line for every scalar in it. The path joins object keys and array indexes
+# with dots, for example "roles.0.tags.1". The type is "s" for a string,
+# "n" for a number, true, false, or null, and "x" for a string with an
+# escape other than \" \\ or \/, which is printed undecoded. JSON escapes
+# every control character, so a value never holds a tab or a newline.
+# Malformed input, or a key that is empty, contains a dot, or needs any
+# escape, prints an error on stderr and returns 2.
+json_flatten() {
+  awk '
+    function fail(msg) { print "json_flatten: " msg > "/dev/stderr"; failed = 1; exit 2 }
+    function path(   i, p) {
+      p = ""
+      for (i = 1; i <= d; i++) p = p (i > 1 ? "." : "") key[i]
+      return p
+    }
+    function decode(raw,   inner, out, i, ch, nx) {
+      inner = substr(raw, 2, length(raw) - 2)
+      decoded_ok = 1
+      if (index(inner, "\\") == 0) return inner
+      out = ""
+      for (i = 1; i <= length(inner); i++) {
+        ch = substr(inner, i, 1)
+        if (ch != "\\") { out = out ch; continue }
+        i++
+        nx = substr(inner, i, 1)
+        if (nx == "\"" || nx == "\\" || nx == "/") { out = out nx; continue }
+        decoded_ok = 0
+        return raw
+      }
+      return out
+    }
+    function value_done() {
+      if (d == 0) done = 1
+      else st[d] = "comma"
+    }
+    function expect_value() {
+      if (d == 0) return !done
+      return st[d] == "value"
+    }
+    { buf = buf $0 "\n" }
+    END {
+      if (failed) exit 2
+      s = buf
+      d = 0
+      done = 0
+      while (s != "") {
+        if (match(s, /^[ \t\r\n]+/)) { s = substr(s, RLENGTH + 1); continue }
+        c = substr(s, 1, 1)
+        if (c == "{" || c == "[") {
+          if (!expect_value()) fail("unexpected " c)
+          if (d > 0 && typ[d] == "a") members[d]++
+          d++
+          if (c == "{") { typ[d] = "o"; st[d] = "key"; key[d] = ""; members[d] = 0 }
+          else          { typ[d] = "a"; st[d] = "value"; key[d] = 0; members[d] = 0 }
+          s = substr(s, 2)
+          continue
+        }
+        if (c == "}" || c == "]") {
+          if (d == 0) fail("unexpected " c)
+          if (c == "}" && typ[d] != "o") fail("unexpected }")
+          if (c == "]" && typ[d] != "a") fail("unexpected ]")
+          if (st[d] != "comma" && !(members[d] == 0 && (st[d] == "key" || st[d] == "value"))) fail("unexpected " c)
+          d--
+          value_done()
+          s = substr(s, 2)
+          continue
+        }
+        if (c == ",") {
+          if (d == 0 || st[d] != "comma") fail("unexpected ,")
+          if (typ[d] == "o") st[d] = "key"
+          else { key[d]++; st[d] = "value" }
+          s = substr(s, 2)
+          continue
+        }
+        if (c == ":") {
+          if (d == 0 || typ[d] != "o" || st[d] != "colon") fail("unexpected :")
+          st[d] = "value"
+          s = substr(s, 2)
+          continue
+        }
+        if (c == "\"") {
+          if (!match(s, /^"([^"\\]|\\.)*"/)) fail("unterminated string")
+          tok = substr(s, 1, RLENGTH)
+          s = substr(s, RLENGTH + 1)
+          if (d > 0 && typ[d] == "o" && st[d] == "key") {
+            k = decode(tok)
+            if (!decoded_ok || k == "" || index(k, ".") > 0) fail("unsupported key " tok)
+            key[d] = k
+            st[d] = "colon"
+            members[d]++
+            continue
+          }
+          if (!expect_value()) fail("unexpected string")
+          if (d > 0 && typ[d] == "a") members[d]++
+          v = decode(tok)
+          print path() "\t" (decoded_ok ? "s" : "x") "\t" v
+          value_done()
+          continue
+        }
+        if (match(s, /^(-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?|true|false|null)/)) {
+          if (!expect_value()) fail("unexpected value")
+          if (d > 0 && typ[d] == "a") members[d]++
+          print path() "\t" "n" "\t" substr(s, 1, RLENGTH)
+          s = substr(s, RLENGTH + 1)
+          value_done()
+          continue
+        }
+        fail("unexpected character " c)
+      }
+      if (!done || d != 0) fail("incomplete document")
+    }
+  '
 }
 
 # Prints the node id that the admin API at the given host:port reports for
