@@ -16,7 +16,7 @@ Blobs are not stored in git. Use `scripts/fetch blobs` to download the
 Garage binary and register it with the BOSH CLI:
 
 ```bash
-# Fetch default version (v1.3.1) for x86_64
+# Fetch default version (v2.3.0) for x86_64
 ./scripts/fetch blobs
 
 # Fetch a specific version

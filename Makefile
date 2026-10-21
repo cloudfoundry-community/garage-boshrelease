@@ -1,7 +1,7 @@
 # garage-boshrelease — development targets.
 #
 # Usage:
-#   make download-blobs              # fetch x86_64 Garage v1.3.1 into blobs/
+#   make download-blobs              # fetch x86_64 Garage v2.3.0 into blobs/
 #   make download-blobs VERSION=1.3.2   # fetch a different version
 #   make download-blobs-all          # fetch both x86_64 and aarch64
 #   make dev-release                 # bosh create-release --force
@@ -9,7 +9,7 @@
 #   make clean                       # remove .dev_builds, dev_releases, tmp
 #   make help                        # show this list
 
-VERSION ?= 1.3.1
+VERSION ?= 2.3.0
 
 .DEFAULT_GOAL := help
 
@@ -36,7 +36,7 @@ dev-release: ## Build a development release (bosh create-release --force)
 
 .PHONY: final-release
 final-release: ## Build a final release (requires VERSION=x.y.z)
-	@if [ "$(VERSION)" = "1.3.1" ]; then \
+	@if [ "$(VERSION)" = "2.3.0" ]; then \
 	  echo "Set VERSION to the release version, e.g. make final-release VERSION=0.1.0" >&2; \
 	  exit 1; \
 	fi
