@@ -2,53 +2,85 @@
 set -euo pipefail
 
 # Managed by BOSH. Do not edit manually.
+<%
+  peers      = link('garage-rpc').instances
+  admin_bind = p('garage.admin_bind_address').to_s
+  if admin_bind.empty?
+    admin_bind = peers.length == 1 ? '127.0.0.1' : spec.ip
+  end
+  local_admin = admin_bind == '0.0.0.0' ? '127.0.0.1' : admin_bind
+-%>
 
 ADMIN_PORT="<%= p('garage.admin_port') %>"
-URL="http://127.0.0.1:${ADMIN_PORT}/health"
-
-echo "Waiting for Garage admin /health at ${URL}..."
-
-for i in $(seq 1 60); do
-  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${URL}" || echo "000")
-  if [ "${CODE}" = "200" ]; then
-    echo "Garage is healthy after ${i} attempts."
-    break
-  fi
-  sleep 2
-done
-
-if [ "${CODE}" != "200" ]; then
-  echo "Garage failed to report healthy within 120s. Last HTTP code: ${CODE}"
-  exit 1
-fi
-
-<% if spec.index > 0 -%>
-# Connect to the bootstrap leader (instance 0) so this node joins the gossip
-# ring. bootstrap_peers cannot be used in garage.toml because it requires the
-# 64-char hex pubkey, which is generated on first start and is unknown at
-# render time. `garage node connect` resolves this at runtime.
+URL="http://<%= local_admin %>:${ADMIN_PORT}/health"
 
 GARAGE_BIN=/var/vcap/packages/garage/bin/garage
 export GARAGE_CONFIG_FILE=/var/vcap/jobs/garage/config/garage.toml
 export GARAGE_RPC_SECRET
 GARAGE_RPC_SECRET="$(cat /var/vcap/jobs/garage/config/rpc_secret)"
 
-LEADER_ADDR="<%= link('garage-rpc').instances[0].address %>"
+# Prints the cluster layout version this node knows about, or 0 when it has
+# none yet. Garage v2 prints "Current cluster layout version: N".
+layout_version() {
+  local v
+  v=$("${GARAGE_BIN}" layout show 2>/dev/null \
+    | awk -F': *' '/^Current cluster layout version:/ { print $2; exit }' || true)
+  echo "${v:-0}"
+}
+
+echo "Waiting for Garage admin /health at ${URL}..."
+
+# /health answers 200 once the node can serve reads and writes. A node that
+# belongs to no applied layout yet (the first deploy of a cluster, or a node
+# being added to one) answers 503 until the post-deploy hook assigns roles,
+# so a 503 from a node whose layout version is still 0 counts as started.
+CODE=000
+FRESH=false
+for i in $(seq 1 60); do
+  CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" --max-time 2 "${URL}" || true)
+  if [ "${CODE}" = "200" ]; then
+    echo "Garage is healthy after ${i} attempts."
+    break
+  fi
+  if [ "${CODE}" = "503" ] && [ "$(layout_version)" = "0" ]; then
+    FRESH=true
+    echo "Garage is running and has no cluster layout yet; post-deploy will assign one."
+    break
+  fi
+  sleep 2
+done
+
+if [ "${CODE}" != "200" ] && [ "${FRESH}" != "true" ]; then
+  echo "Garage failed to report healthy within 120s. Last HTTP code: ${CODE}"
+  exit 1
+fi
+
+<% if spec.index > 0 -%>
+# Join the gossip ring through the first instance. bootstrap_peers cannot be
+# rendered into garage.toml because a peer is named by its node id, which is
+# generated on first start. The Garage v2 CLI also cannot ask a remote node
+# for its id over RPC, so this reads the id from the first instance's admin
+# API (GetNodeInfo) with the shared admin token and then runs
+# `garage node connect`.
+
+LEADER_ADDR="<%= peers[0].address %>"
 LEADER_PORT="<%= p('garage.rpc_port') %>"
 
 # Resolve hostname to IP (getent returns "<ip> <fqdn>"; fall back to the raw
 # address if getent is unavailable or returns nothing).
-LEADER_IP=$(getent hosts "${LEADER_ADDR}" 2>/dev/null | awk '{print $1; exit}')
+LEADER_IP=$(getent hosts "${LEADER_ADDR}" 2>/dev/null | awk '{print $1; exit}' || true)
 LEADER_IP="${LEADER_IP:-${LEADER_ADDR}}"
 
-echo "Querying leader node id at ${LEADER_IP}:${LEADER_PORT}..."
+ADMIN_TOKEN_FILE=/var/vcap/jobs/garage/config/admin_token
+NODE_INFO_URL="http://${LEADER_IP}:${ADMIN_PORT}/v2/GetNodeInfo?node=self"
 
-# Point the CLI at the leader to retrieve its node id.
-export GARAGE_RPC_HOST="${LEADER_IP}:${LEADER_PORT}"
-
+echo "Reading the first instance's node id from ${NODE_INFO_URL}..."
 LEADER_ID=""
 for i in $(seq 1 30); do
-  LEADER_ID=$("${GARAGE_BIN}" node id -q 2>/dev/null | awk -F@ '{print $1}')
+  LEADER_ID=$(curl --silent --max-time 5 \
+      --header "Authorization: Bearer $(cat "${ADMIN_TOKEN_FILE}")" \
+      "${NODE_INFO_URL}" 2>/dev/null \
+    | grep -o '"nodeId": *"[0-9a-f]\{64\}"' | grep -o '[0-9a-f]\{64\}' | head -n1 || true)
   if [ -n "${LEADER_ID}" ]; then
     break
   fi
@@ -56,16 +88,22 @@ for i in $(seq 1 30); do
 done
 
 if [ -z "${LEADER_ID}" ]; then
-  echo "WARNING: could not retrieve leader node id after 60s; manual 'garage node connect' may be needed."
-  # Non-fatal: post-deploy will assign layout roles once gossip forms organically.
+  if [ "${FRESH}" = "true" ]; then
+    echo "FATAL: could not read the first instance's node id after 60s, so this new node cannot join the cluster."
+    exit 1
+  fi
+  # This node already belongs to an applied layout and reconnects to the
+  # peers it has stored, so a missing first instance is not fatal here.
+  echo "WARNING: could not read the first instance's node id; relying on this node's stored peer list."
   exit 0
 fi
 
-# Reset RPC host to local node for the connect call (the connect target is
-# supplied as a CLI argument, not via the env var).
-unset GARAGE_RPC_HOST
-
-echo "Connecting to leader ${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}..."
-"${GARAGE_BIN}" node connect "${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}" \
-  || echo "WARNING: garage node connect returned non-zero (node may already be connected)."
+echo "Connecting to ${LEADER_ID:0:16}@${LEADER_IP}:${LEADER_PORT}..."
+if ! "${GARAGE_BIN}" node connect "${LEADER_ID}@${LEADER_IP}:${LEADER_PORT}"; then
+  if [ "${FRESH}" = "true" ]; then
+    echo "FATAL: garage node connect failed, so this new node cannot join the cluster."
+    exit 1
+  fi
+  echo "WARNING: garage node connect returned non-zero (the node may already be connected)."
+fi
 <% end -%>

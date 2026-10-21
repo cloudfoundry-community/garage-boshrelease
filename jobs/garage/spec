@@ -43,9 +43,19 @@ properties:
 
   garage.admin_port:
     description: |
-      Admin API bind port. Bound to loopback (127.0.0.1) only.
-      Used by BPM post-start health polling and the smoke-tests errand.
+      Admin API bind port. Used by post-start health polling and, in a
+      cluster, by joining nodes to read the first node's node id.
     default: 3903
+
+  garage.admin_bind_address:
+    description: |
+      Address the admin API binds to. When empty, a single-node deployment
+      binds to loopback (127.0.0.1) and a cluster binds to the instance's
+      own IP, because a joining node reads the first node's id from that
+      node's admin API (GetNodeInfo, bearer-token protected). Whenever the
+      admin API is not on loopback, the metrics endpoint also requires the
+      admin token.
+    default: ""
 
   garage.s3_region:
     description: S3 region label returned in API responses.

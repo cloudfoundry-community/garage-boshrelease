@@ -5,16 +5,24 @@ processes:
   executable: /var/vcap/packages/garage/bin/garage
   args:
   - server
-<% if link('garage-rpc').instances.length == 1 -%>
+<%
+  # Garage refuses --default-access-key and --default-bucket unless
+  # --single-node is also given, so a cluster starts with neither flag and
+  # the post-deploy hook provisions the root key and default bucket instead.
+  single_node = link('garage-rpc').instances.length == 1
+-%>
+<% if single_node -%>
   - --single-node
-<% end -%>
   - --default-bucket
+<% end -%>
 
   env:
     GARAGE_CONFIG_FILE: /var/vcap/jobs/garage/config/garage.toml
+<% if single_node -%>
     GARAGE_DEFAULT_ACCESS_KEY: "<%= p('garage.access_key') %>"
     GARAGE_DEFAULT_SECRET_KEY: "<%= p('garage.secret_key') %>"
     GARAGE_DEFAULT_BUCKET: "<%= p('garage.default_bucket') %>"
+<% end -%>
     RUST_LOG: "<%= p('garage.log_level') %>"
     RUST_BACKTRACE: "1"
 

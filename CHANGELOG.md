@@ -26,6 +26,13 @@ All notable changes to garage-boshrelease are documented here.
   `garage.secret_key` (no default), `garage.default_bucket` (default `garage`).
 - `jobs/smoke-tests` properties: `garage.default_bucket` (default `garage`).
 - `scripts/fetch`: default version bumped to `2.3.0`.
+- `jobs/garage` properties: `garage.admin_bind_address` (default empty). An
+  empty value binds the admin API to loopback for one node and to the
+  instance IP for a cluster. Off loopback, `/metrics` requires the admin
+  token (`metrics_require_token`).
+- `jobs/garage` post-deploy: in a cluster, the root S3 key is imported, the
+  default bucket is created, and the key is granted read, write, and owner
+  access, all idempotently.
 
 ### Fixed
 
@@ -44,6 +51,25 @@ All notable changes to garage-boshrelease are documented here.
   v2.x requires that variable be a full `<node-id>@<ip>:<port>` identifier; a
   bare host:port is rejected, breaking the layout bootstrap. The CLI now
   connects to the local node via `rpc_bind_addr` from the config file.
+- `jobs/garage` bpm: a cluster no longer fails to start. `--default-bucket`
+  and the `GARAGE_DEFAULT_*` variables are emitted only with `--single-node`,
+  because Garage v2.x refuses `--default-bucket` in any other mode.
+- `jobs/garage` post-start: a new cluster node whose layout version is still
+  0 may answer 503 on `/health`, and post-start now accepts that. Before,
+  the first deploy of every cluster failed at post-start, because the layout
+  is applied only later, in post-deploy.
+- `jobs/garage` post-start: joining nodes read the first instance's node id
+  from its admin API (`GetNodeInfo`). Garage v2.x ignores a bare
+  `GARAGE_RPC_HOST=<ip>:<port>`, so the old lookup returned the joining
+  node's own id and no node ever joined. A new node that cannot join now
+  fails post-start instead of logging a warning.
+- `jobs/garage` post-deploy: each node is assigned the zone of its own BOSH
+  AZ. Before, every node got the zone of the instance running the hook.
+- `jobs/garage` post-deploy: the layout version is read from Garage v2.x's
+  `Current cluster layout version: N` line. The old `^Version:` match never
+  hit, so every layout change after the first tried to apply version 1.
+- `jobs/garage` env.sh: no longer exports a bare `GARAGE_RPC_HOST`, and it
+  exports `GARAGE_RPC_SECRET` from the staged file.
 - `jobs/smoke-tests`: HeadObject now uses `curl --head` instead of
   `curl -X HEAD`, which would block until timeout waiting for a response body
   that a HEAD response never sends.

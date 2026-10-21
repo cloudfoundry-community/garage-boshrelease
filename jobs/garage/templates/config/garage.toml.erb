@@ -3,6 +3,11 @@
   s3_port     = p('garage.s3_port')
   admin_port  = p('garage.admin_port')
   repl_factor = p('garage.replication_factor').to_i
+  admin_bind  = p('garage.admin_bind_address').to_s
+  if admin_bind.empty?
+    admin_bind = link('garage-rpc').instances.length == 1 ? '127.0.0.1' : spec.ip
+  end
+  admin_loopback = admin_bind == '127.0.0.1'
 -%>
 # Managed by BOSH. Do not edit manually.
 #
@@ -37,8 +42,12 @@ root_domain   = "<%= p('garage.s3_root_domain') %>"
 <% end -%>
 
 [admin]
-api_bind_addr    = "127.0.0.1:<%= admin_port %>"
+api_bind_addr    = "<%= admin_bind %>:<%= admin_port %>"
 admin_token_file = "/var/vcap/jobs/garage/config/admin_token"
+<% unless admin_loopback -%>
+# The admin API is reachable off-host, so /metrics needs the admin token too.
+metrics_require_token = true
+<% end -%>
 # trace_sink is intentionally omitted: it expects an OpenTelemetry OTLP
 # endpoint URL (e.g. "http://localhost:4317"). An empty string is treated
 # as a misconfigured exporter and aborts garage during tracing init. Add it
