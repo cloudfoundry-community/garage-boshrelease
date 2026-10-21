@@ -9,6 +9,7 @@ packages: []
 
 templates:
   bin/run.erb: bin/run
+  config/secret_key.erb: config/secret_key
 
 consumes:
   - name: garage-rpc

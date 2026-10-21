@@ -4,7 +4,12 @@ set -euo pipefail
 # Managed by BOSH. Do not edit manually.
 
 ACCESS_KEY="<%= p('garage.access_key') %>"
-SECRET_KEY="<%= p('garage.secret_key') %>"
+# The secret key lives in its own file rather than in this script. It is
+# read into a shell variable and only ever reaches openssl on stdin, so it
+# never appears on a command line.
+SECRET_KEY_FILE=/var/vcap/jobs/smoke-tests/config/secret_key
+chmod 0600 "${SECRET_KEY_FILE}" 2>/dev/null || true
+SECRET_KEY="$(< "${SECRET_KEY_FILE}")"
 REGION="<%= p('garage.s3_region') %>"
 S3_PORT="<%= p('garage.s3_port') %>"
 ADMIN_PORT="<%= p('garage.admin_port') %>"
@@ -19,6 +24,9 @@ PEERS=(
 
 log() { echo "[smoke] $*"; }
 die() { echo "[smoke] FAIL: $*" >&2; exit 1; }
+
+OUT=$(mktemp)
+trap 'rm -f "${OUT}"' EXIT
 
 # Phase 1: probe S3 API on every peer. Garage S3 returns an HTTP response
 # (typically 400 with InvalidRequest body) for an unauthenticated GET / —
@@ -44,7 +52,41 @@ PAYLOAD="hello-from-garage-smoke-$(date +%s)"
 log "S3 round trip against ${ENDPOINT}, bucket=${BUCKET}, key=${KEY}"
 
 # AWS Signature V4 helpers (HMAC chain).
-sha256_hex() { printf '%s' "$1" | openssl dgst -sha256 -hex | awk '{print $2}'; }
+sha256_hex() { printf '%s' "$1" | openssl dgst -sha256 -hex | awk '{print $NF}'; }
+
+# Prints the bytes that a hex string encodes. printf is a shell builtin, so
+# the bytes never pass through a command line.
+hex_to_bytes() {
+  local hex="$1" esc="" i
+  for ((i = 0; i < ${#hex}; i += 2)); do esc+="\\x${hex:i:2}"; done
+  printf "${esc}"
+}
+
+# HMAC-SHA256 (RFC 2104) of stdin, keyed with the hex key in $1, printed as
+# hex. It is built from plain SHA-256 so that no key material is ever passed
+# to openssl as an argument, which `-macopt key:` or `-macopt hexkey:` would
+# do.
+hmac_sha256_hex() {
+  local key="$1" ipad="" opad="" i b inner
+  if [ "${#key}" -gt 128 ]; then
+    key=$(hex_to_bytes "${key}" | openssl dgst -sha256 -hex | awk '{print $NF}')
+  fi
+  while [ "${#key}" -lt 128 ]; do key+="00"; done
+  for ((i = 0; i < 128; i += 2)); do
+    b=$((16#${key:i:2}))
+    ipad+=$(printf '%02x' $((b ^ 0x36)))
+    opad+=$(printf '%02x' $((b ^ 0x5c)))
+  done
+  inner=$({ hex_to_bytes "${ipad}"; cat; } | openssl dgst -sha256 -hex | awk '{print $NF}')
+  { hex_to_bytes "${opad}"; hex_to_bytes "${inner}"; } | openssl dgst -sha256 -hex | awk '{print $NF}'
+}
+
+# Hex encoding of a string, using only builtins.
+str_to_hex() {
+  local s="$1" i out=""
+  for ((i = 0; i < ${#s}; i++)); do out+=$(printf '%02x' "'${s:i:1}"); done
+  echo "${out}"
+}
 
 aws_sigv4() {
   # Args: method canonical_uri payload_hash query content_type
@@ -59,17 +101,17 @@ aws_sigv4() {
   local SIGNED_HEADERS="content-type;host;x-amz-content-sha256;x-amz-date"
   local CANONICAL_REQ="${METHOD}\n${CANONICAL_URI}\n${QUERY}\n${CANONICAL_HEADERS}\n${SIGNED_HEADERS}\n${PAYLOAD_HASH}"
   local CANONICAL_HASH
-  CANONICAL_HASH=$(printf '%b' "${CANONICAL_REQ}" | openssl dgst -sha256 -hex | awk '{print $2}')
+  CANONICAL_HASH=$(printf '%b' "${CANONICAL_REQ}" | openssl dgst -sha256 -hex | awk '{print $NF}')
 
   local CREDENTIAL_SCOPE="${DATE_STAMP}/${REGION}/${SERVICE}/aws4_request"
   local STRING_TO_SIGN="AWS4-HMAC-SHA256\n${AMZ_DATE}\n${CREDENTIAL_SCOPE}\n${CANONICAL_HASH}"
 
   local DATE_KEY REGION_KEY SERVICE_KEY SIGNING_KEY SIGNATURE
-  DATE_KEY=$(printf '%s' "${DATE_STAMP}" | openssl dgst -sha256 -mac HMAC -macopt "key:AWS4${SECRET_KEY}" -hex | awk '{print $2}')
-  REGION_KEY=$(printf '%s' "${REGION}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${DATE_KEY}" -hex | awk '{print $2}')
-  SERVICE_KEY=$(printf '%s' "${SERVICE}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${REGION_KEY}" -hex | awk '{print $2}')
-  SIGNING_KEY=$(printf '%s' "aws4_request" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${SERVICE_KEY}" -hex | awk '{print $2}')
-  SIGNATURE=$(printf '%b' "${STRING_TO_SIGN}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${SIGNING_KEY}" -hex | awk '{print $2}')
+  DATE_KEY=$(printf '%s' "${DATE_STAMP}" | hmac_sha256_hex "$(str_to_hex "AWS4${SECRET_KEY}")")
+  REGION_KEY=$(printf '%s' "${REGION}" | hmac_sha256_hex "${DATE_KEY}")
+  SERVICE_KEY=$(printf '%s' "${SERVICE}" | hmac_sha256_hex "${REGION_KEY}")
+  SIGNING_KEY=$(printf '%s' "aws4_request" | hmac_sha256_hex "${SERVICE_KEY}")
+  SIGNATURE=$(printf '%b' "${STRING_TO_SIGN}" | hmac_sha256_hex "${SIGNING_KEY}")
 
   echo "Authorization: AWS4-HMAC-SHA256 Credential=${ACCESS_KEY}/${CREDENTIAL_SCOPE}, SignedHeaders=${SIGNED_HEADERS}, Signature=${SIGNATURE}"
   echo "x-amz-content-sha256: ${PAYLOAD_HASH}"
@@ -84,10 +126,10 @@ PAYLOAD_HASH=$(sha256_hex "${PAYLOAD}")
 # PutObject
 log "PutObject /${BUCKET}/${KEY}"
 mapfile -t HDR < <(aws_sigv4 PUT "/${BUCKET}/${KEY}" "${PAYLOAD_HASH}" "" "text/plain")
-CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}/${KEY}" \
+CODE=$(curl -sS -o "${OUT}" -w "%{http_code}" -X PUT "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
   --data-binary "${PAYLOAD}" --max-time "${TIMEOUT}")
-[ "${CODE}" = "200" ] || die "PutObject got ${CODE}: $(cat /tmp/smoke-out)"
+[ "${CODE}" = "200" ] || die "PutObject got ${CODE}: $(cat "${OUT}")"
 
 # GetObject + verify content
 log "GetObject /${BUCKET}/${KEY}"
@@ -100,10 +142,10 @@ BODY=$(curl -sS -X GET "${ENDPOINT}/${BUCKET}/${KEY}" \
 # DeleteObject
 log "DeleteObject /${BUCKET}/${KEY}"
 mapfile -t HDR < <(aws_sigv4 DELETE "/${BUCKET}/${KEY}" "${EMPTY_HASH}" "" "application/xml")
-CODE=$(curl -sS -o /tmp/smoke-out -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}/${KEY}" \
+CODE=$(curl -sS -o "${OUT}" -w "%{http_code}" -X DELETE "${ENDPOINT}/${BUCKET}/${KEY}" \
   -H "${HDR[0]}" -H "${HDR[1]}" -H "${HDR[2]}" -H "${HDR[3]}" -H "${HDR[4]}" \
   --max-time "${TIMEOUT}")
-[ "${CODE}" = "204" ] || die "DeleteObject got ${CODE}: $(cat /tmp/smoke-out)"
+[ "${CODE}" = "204" ] || die "DeleteObject got ${CODE}: $(cat "${OUT}")"
 
 # HeadObject — expect 404 after deletion.
 # Use curl --head, NOT `-X HEAD`. With `-X HEAD` curl issues a HEAD request but
