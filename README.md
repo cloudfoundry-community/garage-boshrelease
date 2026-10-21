@@ -9,8 +9,9 @@ BPM-managed service for Cloud Foundry and BOSH-based platforms.
 Garage is a self-hosted, distributed object store built in Rust. It exposes an
 S3-compatible API on port 3900, an admin API on port 3903, and an RPC
 inter-node channel on port 3901. A single node binds the admin API to
-loopback. A cluster binds it to each instance's own IP, because a joining
-node reads the first node's id from it. This release:
+loopback. A cluster binds it to each instance's own IP, because the
+lifecycle hooks read each peer's node id and layout version from it. This
+release:
 
 - Ships the statically-linked `x86_64-unknown-linux-musl` binary as a BOSH
   blob — no compilation needed on the stemcell.
@@ -19,10 +20,13 @@ node reads the first node's id from it. This release:
 - Uses a `garage-rpc` BOSH link so all instances enumerate peer IPs at
   render time — no hard-coded peer list.
 - Bootstraps the cluster layout idempotently from the post-deploy hook on
-  the last instance (opt-out via `garage.layout.manual: true`), and creates
-  the root S3 key and the default bucket.
+  the instance with the highest index (opt-out via
+  `garage.layout.manual: true`), replaces the role of a node that lost its
+  disk, and creates the root S3 key and the default bucket.
+- Refuses a change to the replication factor, and refuses to delete a node
+  that still holds data, before either can lose anything.
 - Delivers `rpc_secret` and `admin_token` via on-disk files, not inline in
-  the TOML config, to avoid secrets appearing in rendered templates.
+  the TOML config, and keeps every secret off command lines.
 
 ## Requirements
 
@@ -118,33 +122,109 @@ descriptions. Properties in the `smoke-tests` job mirror the main job.
 
 ## Cluster Bootstrap
 
-A single node starts with `garage server --single-node --default-bucket`.
-Garage then assigns the layout itself and creates the root key and the
-default bucket from `garage.access_key`, `garage.secret_key`, and
-`garage.default_bucket`.
+A single node starts with `garage server --single-node --default-bucket`. Garage then assigns the layout itself and creates the root key and the default bucket from `garage.access_key`, `garage.secret_key`, and `garage.default_bucket`.
 
-Garage accepts `--default-bucket` only together with `--single-node`, so a
-cluster starts without either flag, and the lifecycle hooks do that work:
+Garage accepts `--default-bucket` only together with `--single-node`, so a cluster starts without either flag, and the lifecycle hooks do that work instead. Two instances in the `garage-rpc` link have special jobs. The instance with the lowest index is the join target, and the instance with the highest index makes the layout changes. We choose both by index rather than by their position in the link, so a gap in the indexes after a scale-down or a recreate doesn't change which instance does what.
 
-1. On every instance after the first, post-start reads the first instance's
-   node id from its admin API (`GET /v2/GetNodeInfo?node=self`, with the
-   admin token) and runs `garage node connect`.
-2. Post-start accepts a 503 from `/health` while the node has no layout yet,
-   because a cluster has no layout until post-deploy applies one.
-3. On the last instance, post-deploy waits for every peer to appear in
-   `garage status`, then assigns each node with `NO ROLE ASSIGNED` to the
-   zone named after its BOSH AZ, with capacity `garage.layout.capacity`.
-4. It reads the layout version from `garage layout show` and applies the
-   next one.
-5. It imports the root key, creates the default bucket, and grants the key
-   read, write, and owner access to it.
+1. In post-start, every other instance reads the join target's node id from its admin API (`GET /v2/GetNodeInfo?node=self`, with the admin token) and runs `garage node connect`. The join target tries to connect to every other instance once, so a join target that comes back with a wiped disk finds the cluster again.
 
-Each step is idempotent, so later deploys find nothing to do. Set
-`garage.layout.manual: true` to skip the layout and key steps and manage the
-cluster yourself.
+2. Post-start accepts a 503 from `/health` while the node has no layout yet, because a cluster has no layout until post-deploy applies one.
 
-For production clusters (`replication_factor: 3`), each node must be in a
-distinct BOSH availability zone so Garage places replicas in different zones.
+3. In post-deploy, the acting instance waits until every instance in the link is a healthy Garage node, and until its own copy of the layout is as new as the newest one any peer reports. It stops with an error if too few nodes are healthy after a minute, because a layout built from part of the cluster could give roles to the wrong set of nodes.
+
+4. It also stops when the layout has staged changes that it didn't make, because `garage layout apply` would commit them without anyone reviewing them. We review them with `garage layout show`, apply them or drop them with `garage layout revert`, and deploy again.
+
+5. It gives each node that shows `NO ROLE ASSIGNED` a role in the zone named after its BOSH AZ, with the capacity from `garage.layout.capacity`. Each role carries two tags, `bosh-id-<instance id>` and `<instance group>/<index>`. A node whose address isn't in the link is left alone.
+
+6. It applies the next layout version, imports the root key, creates the default bucket, and grants the key read, write, and owner access to it.
+
+Every step is idempotent, so later deploys find nothing to do.
+
+When an instance has no BOSH AZ in the link, or its address doesn't resolve, post-deploy prints a warning banner. An instance without an AZ goes into the acting instance's zone, and an instance that doesn't resolve gets no role. Garage spreads replicas across zones, so every instance should have an AZ. For a production cluster with `replication_factor: 3`, each node should be in its own BOSH AZ, so that Garage places the three copies in three zones.
+
+The capacity default of `1T` is a placeholder, and Garage uses it only to share partitions between nodes in proportion to their capacity. Every node gets the same value, so we set `garage.layout.capacity` to roughly the usable size of the persistent disk, and we give every instance the same disk size.
+
+### Manual layout
+
+With `garage.layout.manual: true`, post-deploy never changes the layout, and we assign roles by hand with `garage layout assign` and `garage layout apply`. Until a layout exists, post-deploy logs that it's waiting for one. On the first deploy after we apply a layout, it creates the root key and the default bucket.
+
+### Replacing a lost node
+
+A node whose persistent disk is lost or recreated starts with a new node id and no role, and Garage keeps listing its old role as failed. BOSH keeps the instance id across a recreate, so post-deploy finds the old role through its `bosh-id-<instance id>` tag. Roles made by an older release have no tags, and for those it falls back to a matching hostname or address. It then assigns the new node with `garage layout assign --replace <old id>`, which hands the old node's partitions to the new one, and Garage copies the data back from the surviving replicas.
+
+Once the old node is down, post-deploy runs `garage layout skip-dead-nodes`, so the cluster stops waiting for the old node to acknowledge the new layout. If a failed role is still in the layout after that, post-deploy prints a warning with its id, and we deal with it by hand with `garage layout remove` or `garage layout assign --replace`.
+
+## Scaling
+
+Every change to `instances` changes the peer list that's rendered into each node's configuration, so BOSH restarts every instance, one at a time, on every scale.
+
+### Scaling up
+
+We raise `instances` and deploy. The new instances join through the join target, and because the acting instance is the one with the highest index, one of the new instances gives them their roles. Garage then moves partitions onto the new nodes in the background.
+
+A deployment that grows from one instance to several also stops running with `--single-node`, and its admin API moves from loopback to the instance IP. The replication factor stays what it was, as the next section explains.
+
+### Scaling down
+
+Removing a node that still holds a role takes its share of the data with it, so the garage job's drain script refuses to let BOSH delete such a node from a cluster of more than one node. We take the role away first and lower the instance count only after Garage has moved the data.
+
+1. Find the node id of each instance that's going away. `garage status` shows each role's `<instance group>/<index>` tag next to the node id. BOSH normally deletes the instances with the highest indexes, and if it picks a different one, its drain refuses and the deploy stops before anything is lost.
+
+2. On any node, run `garage layout remove <node id>` for each of those nodes.
+
+3. Check the staged change with `garage layout show`, and apply it with `garage layout apply --version <next version>`.
+
+4. Wait until `garage layout history` reports that the cluster is in a stable state with a single live layout version. That means Garage has finished moving the data off the removed nodes.
+
+5. Lower `instances` in the manifest and deploy.
+
+We don't deploy between step 2 and step 5. A deploy in that window still sees the removed nodes in the link, and post-deploy gives them their roles back.
+
+The cluster must keep at least as many nodes as the replication factor, so a cluster with `replication_factor: 3` can't go below three nodes.
+
+When drain refuses, it prints these steps. When the role is gone but Garage is still moving data, drain waits up to 30 minutes for the layout to become stable, and then refuses. If a node is already out of the layout and its process can't run, we deploy with `--skip-drain` for that instance group. Deleting the whole deployment with `bosh delete-deployment` drains every instance as well, and every drain refuses, so we pass `--force` to delete a cluster we no longer want.
+
+### Drain on an ordinary stop
+
+When BOSH stops or updates an instance without deleting it, drain waits up to two minutes for the node's block resync queue to empty, so blocks on their way to other nodes aren't cut off. Drain never stops the process itself. bpm stops it after drain returns.
+
+## Replication Factor
+
+Garage can't change the replication factor of a cluster that already has a layout. It refuses to start when the configured value differs from the stored one, and the resulting crash loop is hard to read. Pre-start therefore records the value in `/var/vcap/store/garage/replication_factor` the first time a node starts, and on every later start it compares that value with `garage.replication_factor`. When they differ, pre-start fails before Garage starts and prints what to do. bpm runs the same check before every start, so a restart by monit is covered too.
+
+To keep the cluster, we set `garage.replication_factor` back to the recorded value and deploy again. To move to a new replication factor, we deploy a second Garage cluster with the new value, copy the buckets across with an S3 tool such as rclone, point clients at the new cluster, and then delete the old one. We never try to get around the check by deleting files under the metadata directory, because those files hold the cluster's layout.
+
+A node from an older release has a layout but no marker. Pre-start lets it start, Garage itself checks the stored layout against the configuration, and post-start writes the marker once Garage is running with that value.
+
+## Starting a Stopped Cluster
+
+When every node is down, BOSH still starts them one at a time. The first nodes to start find their peers down and have no quorum, so `/health` answers 503. Post-start waits 45 seconds, and if `garage status` then lists some peers as failed, it accepts the start with a warning so that BOSH goes on to the next instance. The cluster serves reads and writes again once enough nodes are up, and we check `garage status` after the deploy.
+
+A node that can reach all of its peers and still answers 503 after two minutes fails post-start, because something other than missing peers is wrong. A new node with no layout yet is always accepted, because post-deploy gives it a role later.
+
+## Secrets
+
+The RPC secret and the admin token are written by pre-start to files that only `vcap` can read, and `garage.toml` points at those files. The lifecycle scripts never pass a secret on a command line. They send the admin token to the admin API through a curl header file (`curl -H @file`) that only root can read. Post-deploy imports the root S3 key through the admin API (`POST /v2/ImportKey`), with the secret read from another root-only file that pre-start writes, because `garage key import` would put the secret on the command line.
+
+The smoke-tests errand computes its AWS Signature Version 4 HMACs in bash and pipes the input to `openssl dgst -sha256`, so no key material appears on a command line there either. Its secret key comes from a rendered configuration file that the errand restricts to root before it reads it.
+
+The admin API in a cluster listens on the instance IP so that the hooks can read each peer's node id and layout version, and every request to it needs the admin token.
+
+## Upgrading from 0.0.1 (Garage v1)
+
+Release 0.0.1 packaged Garage v1.3.1, and this release packages Garage v2.3.0. Garage v1 and v2 nodes can't run in the same cluster, so a rolling upgrade doesn't work. The [upstream migration guide](https://garagehq.deuxfleurs.fr/documentation/working-documents/migration-2/) says to stop every node and start them all again on v2 at the same time. Garage v2 marks its stored layout the same way v1 does, so the release can't tell a v1 node from a v2 node, and following this procedure is up to us.
+
+1. On any node, run `garage repair --all-nodes --yes tables`, and wait until `garage worker list` shows the repair workers as done.
+
+2. Run `garage meta snapshot --all`. Then copy `snapshots`, `cluster_layout`, `data_layout`, `node_key`, and `node_key.pub` from `/var/vcap/store/garage/meta` on every node to somewhere safe, for example with `bosh scp`.
+
+3. Release 0.0.1 already used `replication_factor` rather than v1's `replication_mode`, so the configuration needs no change for that. Keep `garage.replication_factor` and `instances` exactly as they are for this deploy.
+
+4. Deploy the new release with `bosh deploy --canaries=0 --max-in-flight=100%`, so that BOSH stops every instance and starts them all together.
+
+5. Check `garage status` and `garage layout show`, run the `smoke-tests` errand, and keep an eye on the cluster for the next few hours.
+
+Nodes from 0.0.1 have no replication factor marker, and post-start writes one during this deploy. Their roles have no tags either, so a later replacement falls back to matching the old role by hostname or address.
 
 ## Architecture
 
@@ -191,10 +271,7 @@ The errand:
 4. Deletes it via DeleteObject.
 5. Confirms it is gone via HeadObject, which must return 404.
 
-Auth uses AWS Signature Version 4 via `curl` and `openssl dgst -mac HMAC`.
-No packages beyond the stemcell's base tools are needed. The errand has been
-exercised against OpenSSL 3.5 and the uutils coreutils that Ubuntu 26.04
-resolute ships.
+Auth uses AWS Signature Version 4, signed with HMACs computed in bash over `openssl dgst -sha256`. No packages beyond the stemcell's base tools are needed. The errand has been exercised against OpenSSL 3.5 and the uutils coreutils that Ubuntu 26.04 resolute ships.
 
 ## Release Process
 

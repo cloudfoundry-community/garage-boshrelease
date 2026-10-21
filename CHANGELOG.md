@@ -12,6 +12,17 @@ All notable changes to garage-boshrelease are documented here.
   removed; the bucket is created automatically by Garage on first start via
   `GARAGE_DEFAULT_BUCKET`. The test key is unique per run
   (`smoke-<epoch>-<pid>`).
+- `jobs/garage` post-deploy: the instance with the highest index in the `garage-rpc` link now makes the layout changes, and post-start joins every node through the instance with the lowest index. Both were chosen by position in the link before, which broke when the indexes had gaps.
+- `jobs/garage` post-deploy: it waits until every instance in the link is a healthy Garage node and fails if too few are up after a minute. Before, it counted failed nodes as present and carried on with a warning.
+- `jobs/garage` post-deploy: it waits until the local node has the newest layout any peer reports. A single node that already had its own layout was scaled out onto a stale view of version 0, and the apply was rejected.
+- `jobs/garage` post-deploy: it refuses to run when the layout has staged changes it didn't make, because `garage layout apply` would commit them unreviewed. It also leaves alone any node whose address isn't in the link.
+- `jobs/garage` post-deploy: each new role carries the tags `bosh-id-<instance id>` and `<instance group>/<index>`.
+- `jobs/garage` post-deploy: with `garage.layout.manual: true`, the root key and the default bucket are created on the first deploy after the operator applies a layout, and until then the hook logs that it's waiting.
+- `jobs/garage` drain: drain no longer stops the process, which raced monit, and it no longer always reports success. On an ordinary stop it waits up to two minutes for the block resync queue to empty. When BOSH is deleting the instance, it refuses while the node still holds a role in a layout with more than one node, and it waits up to 30 minutes for the layout to become stable once the role is gone. The README describes the scale-down procedure that drain points to.
+- `jobs/garage` post-start: when a node that has a layout can't reach its peers, a 503 from `/health` is accepted with a warning after 45 seconds, so a fully stopped cluster can start one instance at a time. A node that can reach all its peers and still answers 503 fails after two minutes.
+- `jobs/garage` post-start: the join target now tries to connect to every other instance, so a join target that comes back with a wiped disk finds the cluster again.
+- `jobs/garage`: the admin token reaches curl through a root-only header file (`curl -H @file`), and the root S3 secret is imported through the admin API (`POST /v2/ImportKey`) from a root-only file that pre-start writes. Neither secret appears on a command line or in a rendered script any more.
+- `jobs/smoke-tests`: the AWS Signature Version 4 HMACs are computed in bash over `openssl dgst -sha256`, so no key reaches a command line. The secret key comes from a rendered file that the errand restricts to root, and the response body goes to a `mktemp` file that's removed on exit.
 
 ### Added
 
@@ -25,7 +36,7 @@ All notable changes to garage-boshrelease are documented here.
 - `jobs/garage` properties: `garage.access_key` (no default),
   `garage.secret_key` (no default), `garage.default_bucket` (default `garage`).
 - `jobs/smoke-tests` properties: `garage.default_bucket` (default `garage`).
-- `scripts/fetch`: default version bumped to `2.3.0`.
+- `scripts/fetch`: the default version is now `2.3.0`.
 - `jobs/garage` properties: `garage.admin_bind_address` (default empty). An
   empty value binds the admin API to loopback for one node and to the
   instance IP for a cluster. Off loopback, `/metrics` requires the admin
@@ -33,6 +44,9 @@ All notable changes to garage-boshrelease are documented here.
 - `jobs/garage` post-deploy: in a cluster, the root S3 key is imported, the
   default bucket is created, and the key is granted read, write, and owner
   access, all idempotently.
+- `jobs/garage` pre-start: a new guard protects the replication factor. Pre-start records `garage.replication_factor` in `/var/vcap/store/garage/replication_factor` and refuses to start a node whose rendered value differs, with a message that explains how to keep or replace the cluster. bpm runs the same check before every start. A node from an older release gets the marker from post-start once Garage has started with the configured value.
+- `jobs/garage` post-deploy: a node that comes back with a new node id after its disk was lost takes over its old role through `garage layout assign --replace`, matched by the `bosh-id` tag, or by hostname or address for an untagged role. Once the old node is down, the hook runs `garage layout skip-dead-nodes`.
+- README: we now document the scale-down procedure, the replication factor guard, how to start a stopped cluster, secret handling, and the upgrade from 0.0.1. Garage v1 and v2 nodes can't share a cluster, so the upgrade stops every node and starts them all on v2 together with `bosh deploy --canaries=0 --max-in-flight=100%`, after a table repair and a metadata snapshot.
 
 ### Fixed
 
@@ -58,11 +72,7 @@ All notable changes to garage-boshrelease are documented here.
   0 may answer 503 on `/health`, and post-start now accepts that. Before,
   the first deploy of every cluster failed at post-start, because the layout
   is applied only later, in post-deploy.
-- `jobs/garage` post-start: joining nodes read the first instance's node id
-  from its admin API (`GetNodeInfo`). Garage v2.x ignores a bare
-  `GARAGE_RPC_HOST=<ip>:<port>`, so the old lookup returned the joining
-  node's own id and no node ever joined. A new node that cannot join now
-  fails post-start instead of logging a warning.
+- `jobs/garage` post-start: joining nodes read the join target's node id from its admin API (`GetNodeInfo`). Garage v2.x ignores a bare `GARAGE_RPC_HOST=<ip>:<port>`, so the old lookup returned the joining node's own id and no node ever joined. A new node that can't join now fails post-start instead of logging a warning.
 - `jobs/garage` post-deploy: each node is assigned the zone of its own BOSH
   AZ. Before, every node got the zone of the instance running the hook.
 - `jobs/garage` post-deploy: the layout version is read from Garage v2.x's
@@ -73,6 +83,9 @@ All notable changes to garage-boshrelease are documented here.
 - `jobs/smoke-tests`: HeadObject now uses `curl --head` instead of
   `curl -X HEAD`, which would block until timeout waiting for a response body
   that a HEAD response never sends.
+- `jobs/garage` post-start and post-deploy: a failed `garage layout show` is now fatal. Before, a CLI error read as layout version 0, which made a node look brand new.
+- `jobs/garage` post-deploy: link addresses are resolved with `getent ahostsv4`, and an instance without a BOSH AZ, or with an address that doesn't resolve, gets a loud warning instead of a silent fallback.
+- `jobs/garage`: IPv6 addresses are bracketed in `garage.toml` and in the scripts, and a wildcard admin bind of `::` is reached through `::1`.
 
 ## 0.0.1 (2026-05-21)
 
