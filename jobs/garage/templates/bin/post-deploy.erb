@@ -14,9 +14,10 @@ set -euo pipefail
 #
 #   1. waits until every instance in the link is a healthy Garage node;
 #   2. refuses to continue when the layout has staged changes it did not make;
-#   3. assigns a role to every node in the link that has none, in the zone of
-#      its BOSH AZ, and swaps it in for the failed role of the same BOSH
-#      instance with `--replace` when its disk was wiped;
+#   3. tags every role from an earlier release with the BOSH instance it
+#      belongs to, assigns a role to every node in the link that has none,
+#      in the zone of its BOSH AZ, and swaps it in for the old role of the
+#      same BOSH instance with `--replace` when its disk was wiped;
 #   4. applies the next layout version;
 #   5. makes sure the root S3 key and the default bucket exist.
 #
@@ -65,12 +66,59 @@ import_root_key() {
   ( umask 077
     printf '{"accessKeyId":"%s","secretAccessKey":"%s","name":"default access key"}' \
       "${ACCESS_KEY}" "${secret}" > "${body}" )
+  local rc=0
   admin_curl --request POST --header 'Content-Type: application/json' \
-    --data-binary @"${body}" "${LOCAL_ADMIN_URL}/v2/ImportKey" >/dev/null 2>&1
-  local rc=$?
+    --data-binary @"${body}" "${LOCAL_ADMIN_URL}/v2/ImportKey" >/dev/null 2>&1 || rc=$?
   rm -f "${body}"
+  [ "${rc}" -eq 0 ] || echo "the ImportKey admin API call failed (curl exit ${rc})"
   return ${rc}
 }
+
+# Prints the permission flags (for example "RWO") that the given key has on
+# the given bucket, or nothing when the bucket cannot be read or the key has
+# no access to it.
+bucket_key_permissions() {
+  "${GARAGE_BIN}" bucket info "$1" 2>/dev/null | awk -v key="$2" '
+    /^==== .* ====$/ { s = ($0 == "==== KEYS FOR THIS BUCKET ===="); next }
+    s && $2 == key { print $1; exit }
+  ' || true
+}
+
+has_full_access() {
+  local perms
+  perms=$(bucket_key_permissions "${DEFAULT_BUCKET}" "${ACCESS_KEY}")
+  [[ "${perms}" == *R* && "${perms}" == *W* && "${perms}" == *O* ]]
+}
+
+# Bucket and key operations need a quorum in every live layout version, and
+# that can take a while to settle after a layout change, so each step is
+# retried for up to PROVISION_WAIT seconds. Each step first checks whether
+# its work is already done, so a cluster that already has the key, the
+# bucket, and the grant makes no writes at all.
+PROVISION_WAIT=180
+
+provision_step() {
+  local what="$1" check="$2" act="$3" start=${SECONDS} out=""
+  while :; do
+    if "${check}"; then
+      return 0
+    fi
+    if out=$("${act}" 2>&1); then
+      log "${what}."
+      return 0
+    fi
+    if [ $((SECONDS - start)) -ge "${PROVISION_WAIT}" ]; then
+      die "could not finish this step after ${PROVISION_WAIT}s: ${what}. Last error: ${out}"
+    fi
+    log "  ${what} failed (${out}); retrying..."
+    sleep 5
+  done
+}
+
+key_exists()     { "${GARAGE_BIN}" key info "${ACCESS_KEY}" >/dev/null 2>&1; }
+bucket_exists()  { "${GARAGE_BIN}" bucket info "${DEFAULT_BUCKET}" >/dev/null 2>&1; }
+create_bucket()  { "${GARAGE_BIN}" bucket create "${DEFAULT_BUCKET}"; }
+grant_root_key() { "${GARAGE_BIN}" bucket allow --read --write --owner "${DEFAULT_BUCKET}" --key "${ACCESS_KEY}"; }
 
 provision_root_key_and_bucket() {
   if [ "${EXPECTED_PEERS}" -le 1 ]; then
@@ -80,46 +128,24 @@ provision_root_key_and_bucket() {
     log "garage.access_key or garage.secret_key is empty, so the root S3 key is not provisioned."
     return 0
   fi
-
-  # Bucket and key writes need a quorum on the new layout, which can take a
-  # few seconds to settle after `garage layout apply`.
-  local ok=false i
-  for i in $(seq 1 30); do
-    if "${GARAGE_BIN}" key info "${ACCESS_KEY}" >/dev/null 2>&1; then
-      ok=true
-      break
-    fi
-    if import_root_key; then
-      log "imported the root S3 key ${ACCESS_KEY}."
-      ok=true
-      break
-    fi
-    sleep 2
-  done
-  [ "${ok}" = "true" ] || die "could not import the root S3 key after 60s."
-
-  ok=false
-  for i in $(seq 1 30); do
-    if "${GARAGE_BIN}" bucket info "${DEFAULT_BUCKET}" >/dev/null 2>&1; then
-      ok=true
-      break
-    fi
-    if "${GARAGE_BIN}" bucket create "${DEFAULT_BUCKET}" >/dev/null 2>&1; then
-      log "created the default bucket ${DEFAULT_BUCKET}."
-      ok=true
-      break
-    fi
-    sleep 2
-  done
-  [ "${ok}" = "true" ] || die "could not create the default bucket ${DEFAULT_BUCKET} after 60s."
-
-  "${GARAGE_BIN}" bucket allow --read --write --owner "${DEFAULT_BUCKET}" --key "${ACCESS_KEY}" >/dev/null
-  log "root S3 key has read, write, and owner access to ${DEFAULT_BUCKET}."
+  provision_step "imported the root S3 key ${ACCESS_KEY}" key_exists import_root_key
+  provision_step "created the default bucket ${DEFAULT_BUCKET}" bucket_exists create_bucket
+  provision_step "granted the root S3 key read, write, and owner access to ${DEFAULT_BUCKET}" has_full_access grant_root_key
+  log "the root S3 key and the default bucket ${DEFAULT_BUCKET} are in place."
 }
 
 # ── only the highest index drives the cluster-wide operation ─────────────────
 if [ "${INSTANCE_INDEX}" != "${ACTING_INDEX}" ]; then
   log "instance index ${INSTANCE_INDEX} is not the highest in the link (${ACTING_INDEX}), so it leaves the layout alone."
+  exit 0
+fi
+
+# ── a single node manages itself ─────────────────────────────────────────────
+# With one instance, Garage runs with --single-node and makes its own layout,
+# root key, and default bucket. It also refuses to start in that mode once
+# the layout version is above 1, so this hook must not change the layout.
+if [ "${EXPECTED_PEERS}" -le 1 ]; then
+  log "this is the only instance in the garage-rpc link, so Garage manages its own layout, root key, and bucket."
   exit 0
 fi
 
@@ -246,77 +272,159 @@ if has_staged_changes <<< "${LAYOUT_OUT}"; then
 fi
 CURRENT_VERSION=$(layout_version) || die "could not read the cluster layout version."
 
-# ── find nodes without a role, and the roles they replace ────────────────────
-# Healthy rows read "ID Hostname Address Tags Zone ...", and a node without
-# a role has an empty Tags column followed by "NO ROLE ASSIGNED".
-HEALTHY_ROWS=$(healthy_rows <<< "${STATUS_OUTPUT}")
-NODE_ROWS=$(printf '%s\n%s\n' "${HEALTHY_ROWS}" "$(failed_rows <<< "${STATUS_OUTPUT}")")
-UNASSIGNED=$(awk '/NO ROLE ASSIGNED/ { print $1, $2, $3 }' <<< "${HEALTHY_ROWS}")
-# Current layout rows read "ID Tags Zone Capacity ...".
-ROLE_TAGS=$(current_layout_rows <<< "${LAYOUT_OUT}" | awk '{ print $1, $2 }')
-
-# Prints the role that a node without a role replaces, or nothing. One BOSH
-# instance runs one Garage node, so a role that belongs to the same instance
-# under another node id is that instance's old identity, lost with its disk.
-# Garage keeps listing that identity as healthy for a while after its VM
-# goes away, and it forgets a failed node's address, so the match does not
-# depend on whether Garage has noticed the failure yet.
+# ── plan the layout change ───────────────────────────────────────────────────
+# Everything is planned before anything is staged, so a refusal leaves the
+# layout untouched.
 #
-# Every role this hook assigns carries a "bosh-id-<instance id>" tag, which
-# is matched first. A role without that tag, from an earlier release, is
-# matched by the same hostname or the same last known address.
-old_role_for() {
-  local nid="$1" host="$2" addr="$3" iid="$4" rid tags rhost raddr
-  while read -r rid tags; do
-    [ -n "${rid}" ] && [ "${rid}" != "${nid}" ] || continue
-    case "${tags}" in
-      *"bosh-id-${iid}"[],]*) echo "${rid}"; return 0 ;;
-    esac
-  done <<< "${ROLE_TAGS}"
-  while read -r rid tags; do
-    [ -n "${rid}" ] && [ "${rid}" != "${nid}" ] || continue
-    case "${tags}" in *bosh-id-*) continue ;; esac
-    rhost=$(awk -v id="${rid}" '$1 == id { print $2; exit }' <<< "${NODE_ROWS}")
-    raddr=$(awk -v id="${rid}" '$1 == id { print $3; exit }' <<< "${HEALTHY_ROWS}")
-    if { [ "${host}" != "?" ] && [ "${rhost}" = "${host}" ]; } \
-       || { [ -n "${raddr}" ] && [ "${raddr}" = "${addr}" ]; }; then
-      echo "${rid}"
-      return 0
-    fi
-  done <<< "${ROLE_TAGS}"
-}
+# Healthy rows read "ID Hostname Address Tags Zone ...", and a node without
+# a role has "[]" or an empty Tags column followed by "NO ROLE ASSIGNED".
+# Current layout rows read "ID Tags Zone Capacity ...", with tags written as
+# "[a,b]" and no tags as "[]".
+HEALTHY_ROWS=$(healthy_rows <<< "${STATUS_OUTPUT}")
+HEALTHY_IDS=$(awk '{ print $1 }' <<< "${HEALTHY_ROWS}")
+UNASSIGNED=$(awk '/NO ROLE ASSIGNED/ { print $1, $3 }' <<< "${HEALTHY_ROWS}")
+LAYOUT_ROWS=$(current_layout_rows <<< "${LAYOUT_OUT}" | awk '{ print $1, $2, $3 }')
+ROLE_COUNT=$(awk 'NF' <<< "${LAYOUT_ROWS}" | wc -l | tr -d ' ')
+LINK_COUNT="${EXPECTED_HEALTHY}"
 
-ASSIGNED=0
-REPLACED=""
-while read -r NODE_ID NODE_HOST NODE_ADDR; do
+is_healthy() { grep -qxF "$1" <<< "${HEALTHY_IDS}"; }
+link_entry_for_ip() { awk -v ip="$1" '$1 == ip { print; exit }' <<< "${LINK_TABLE}"; }
+
+# ROLE_IID maps each role to the BOSH instance id it belongs to. A role this
+# hook assigned carries a "bosh-id-<instance id>" tag. A role from an earlier
+# release has no tag, and when its node is healthy and its address belongs
+# to a link instance, it is tagged in this deploy (TAG_PLAN). A failed node
+# has no address in `garage status`, so an untagged failed role stays
+# unmapped.
+declare -A ROLE_IID=() ROLE_ZONE=() TAG_PLAN=() IID_CLAIMS=()
+while read -r RID TAGS ZONE; do
+  [ -n "${RID}" ] || continue
+  ROLE_ZONE["${RID}"]="${ZONE}"
+  IID=$(grep -o 'bosh-id-[^],]*' <<< "${TAGS}" | head -n1 | sed 's/^bosh-id-//') || IID=""
+  if [ -n "${IID}" ]; then
+    ROLE_IID["${RID}"]="${IID}"
+    IID_CLAIMS["${IID}"]="${IID_CLAIMS[${IID}]:-}${RID} "
+  fi
+done <<< "${LAYOUT_ROWS}"
+
+declare -A UNTAGGED_CLAIMS=()
+while read -r RID TAGS ZONE; do
+  [ -n "${RID}" ] && [ -z "${ROLE_IID[${RID}]:-}" ] || continue
+  is_healthy "${RID}" || continue
+  RADDR=$(awk -v id="${RID}" '$1 == id { print $3; exit }' <<< "${HEALTHY_ROWS}")
+  ENTRY=$(link_entry_for_ip "$(strip_port "${RADDR}")")
+  [ -n "${ENTRY}" ] || continue
+  read -r _ IDX IID _ NAME <<< "${ENTRY}"
+  UNTAGGED_CLAIMS["${IID}"]="${UNTAGGED_CLAIMS[${IID}]:-}${RID} "
+  TAG_PLAN["${RID}"]="${IID} ${NAME}/${IDX}"
+done <<< "${LAYOUT_ROWS}"
+
+# A role is tagged only when it is the one role that maps to its instance.
+for IID in "${!UNTAGGED_CLAIMS[@]}"; do
+  read -r -a CLAIMANTS <<< "${UNTAGGED_CLAIMS[${IID}]}"
+  if [ -n "${IID_CLAIMS[${IID}]:-}" ] || [ "${#CLAIMANTS[@]}" -gt 1 ]; then
+    for RID in "${CLAIMANTS[@]}"; do unset "TAG_PLAN[${RID}]"; done
+    log "WARNING: role(s) ${UNTAGGED_CLAIMS[${IID}]}have no bosh-id tag, but instance ${IID} already maps to role(s) ${IID_CLAIMS[${IID}]:-}${UNTAGGED_CLAIMS[${IID}]}so none of them is tagged."
+    continue
+  fi
+  ROLE_IID["${CLAIMANTS[0]}"]="${IID}"
+  IID_CLAIMS["${IID}"]="${CLAIMANTS[0]} "
+done
+
+# For every link node without a role, decide whether it takes over an old
+# role with `--replace` or gets a new one.
+#
+# 1. A role mapped to the same BOSH instance under another node id is that
+#    instance's old identity, lost with its disk. Garage can keep listing it
+#    as healthy for a while after the old node went away, so the match does
+#    not depend on health.
+# 2. Otherwise, when a new role would leave the layout with more roles than
+#    link instances, a failed role in the node's zone that belongs to no
+#    other instance is the old identity. Exactly one such role is replaced.
+#    More than one is ambiguous, and the hook refuses rather than guess.
+# 3. Otherwise the node gets a new role, as when the cluster grows.
+#
+# No role is ever removed outside these replacements.
+declare -A REPLACE_TARGET=()
+PLAN=()
+NEW_COUNT=0
+while read -r NODE_ID NODE_ADDR; do
   [ -n "${NODE_ID}" ] || continue
-  NODE_IP=$(strip_port "${NODE_ADDR}")
-  ENTRY=$(awk -v ip="${NODE_IP}" '$1 == ip { print; exit }' <<< "${LINK_TABLE}")
+  ENTRY=$(link_entry_for_ip "$(strip_port "${NODE_ADDR}")")
   if [ -z "${ENTRY}" ]; then
     log "WARNING: node ${NODE_ID} at ${NODE_ADDR} has no role, but its address is not in the garage-rpc link, so it is left alone."
     continue
   fi
   read -r _ IDX IID NODE_ZONE NAME <<< "${ENTRY}"
-  OLD_ID=$(old_role_for "${NODE_ID}" "${NODE_HOST}" "${NODE_ADDR}" "${IID}")
+
+  OLD_ID=""
+  for RID in "${!ROLE_IID[@]}"; do
+    [ "${RID}" != "${NODE_ID}" ] && [ "${ROLE_IID[${RID}]}" = "${IID}" ] || continue
+    [ -z "${REPLACE_TARGET[${RID}]:-}" ] || continue
+    OLD_ID="${RID}"
+    log "node ${NODE_ID} on ${NAME}/${IDX} replaces role ${OLD_ID}, which belongs to the same BOSH instance."
+    break
+  done
+
+  if [ -z "${OLD_ID}" ] && [ $((ROLE_COUNT + NEW_COUNT + 1)) -gt "${LINK_COUNT}" ]; then
+    CANDIDATES=()
+    while read -r RID _ _; do
+      [ -n "${RID}" ] && [ "${RID}" != "${NODE_ID}" ] || continue
+      [ -z "${REPLACE_TARGET[${RID}]:-}" ] || continue
+      is_healthy "${RID}" && continue
+      [ "${ROLE_ZONE[${RID}]}" = "${NODE_ZONE}" ] || continue
+      case "${ROLE_IID[${RID}]:-}" in ""|"${IID}") CANDIDATES+=("${RID}") ;; esac
+    done <<< "${LAYOUT_ROWS}"
+    if [ "${#CANDIDATES[@]}" -gt 1 ]; then
+      die "node ${NODE_ID} on ${NAME}/${IDX} has no role, and the zone ${NODE_ZONE} holds ${#CANDIDATES[@]} failed roles that could be its old identity (${CANDIDATES[*]}). Nothing has been changed. Find the role that belonged to ${NAME}/${IDX}, assign the new node with \`garage layout assign ${NODE_ID} -z ${NODE_ZONE} -c ${CAPACITY} -t bosh-id-${IID} -t ${NAME}/${IDX} --replace <old id>\`, apply the layout, and deploy again."
+    fi
+    if [ "${#CANDIDATES[@]}" -eq 1 ]; then
+      OLD_ID="${CANDIDATES[0]}"
+      log "node ${NODE_ID} on ${NAME}/${IDX} replaces the failed role ${OLD_ID}, the only failed role in zone ${NODE_ZONE} that belongs to no other instance."
+    else
+      log "WARNING: a new role for node ${NODE_ID} leaves the layout with more roles than the ${LINK_COUNT} link instances, and no failed role in zone ${NODE_ZONE} can be matched to it."
+    fi
+  fi
+
+  if [ -n "${OLD_ID}" ]; then
+    REPLACE_TARGET["${OLD_ID}"]="${NODE_ID}"
+  else
+    NEW_COUNT=$((NEW_COUNT + 1))
+  fi
+  PLAN+=("${NODE_ID} ${IID} ${NODE_ZONE} ${NAME}/${IDX} ${OLD_ID}")
+done <<< "${UNASSIGNED}"
+
+# ── stage and apply ──────────────────────────────────────────────────────────
+STAGED=0
+for RID in "${!TAG_PLAN[@]}"; do
+  [ -z "${REPLACE_TARGET[${RID}]:-}" ] || continue
+  read -r IID INSTANCE <<< "${TAG_PLAN[${RID}]}"
+  log "tagging role ${RID} as ${INSTANCE} (bosh-id-${IID}); its zone and capacity stay as they are."
+  "${GARAGE_BIN}" layout assign "${RID}" -t "bosh-id-${IID}" -t "${INSTANCE}" >/dev/null
+  STAGED=$((STAGED + 1))
+done
+
+REPLACED=""
+for LINE in "${PLAN[@]}"; do
+  read -r NODE_ID IID NODE_ZONE INSTANCE OLD_ID <<< "${LINE}"
   REPLACE_ARGS=()
   if [ -n "${OLD_ID}" ]; then
     REPLACE_ARGS=(--replace "${OLD_ID}")
     REPLACED+="${OLD_ID} "
-    log "node ${NODE_ID} on ${NAME}/${IDX} replaces role ${OLD_ID}, the identity the same instance had before its disk was replaced."
   fi
-  log "assigning role: id=${NODE_ID} instance=${NAME}/${IDX} address=${NODE_ADDR} zone=${NODE_ZONE} capacity=${CAPACITY}"
+  log "assigning role: id=${NODE_ID} instance=${INSTANCE} zone=${NODE_ZONE} capacity=${CAPACITY}${OLD_ID:+ replacing=${OLD_ID}}"
   "${GARAGE_BIN}" layout assign "${NODE_ID}" -z "${NODE_ZONE}" -c "${CAPACITY}" \
-    -t "bosh-id-${IID}" -t "${NAME}/${IDX}" "${REPLACE_ARGS[@]}" >/dev/null
-  ASSIGNED=$((ASSIGNED + 1))
-done <<< "${UNASSIGNED}"
+    -t "bosh-id-${IID}" -t "${INSTANCE}" "${REPLACE_ARGS[@]}" >/dev/null
+  STAGED=$((STAGED + 1))
+done
 
-if [ "${ASSIGNED}" -eq 0 ]; then
-  log "no unassigned nodes, so the cluster layout is already established."
+if [ "${STAGED}" -eq 0 ]; then
+  log "every link node has a tagged role, so the cluster layout is already established."
 else
   NEXT_VERSION=$((CURRENT_VERSION + 1))
   log "applying layout version ${NEXT_VERSION}..."
   "${GARAGE_BIN}" layout apply --version "${NEXT_VERSION}"
-  log "bootstrap complete. New cluster layout version: ${NEXT_VERSION}."
+  log "applied cluster layout version ${NEXT_VERSION}."
 
   if [ -n "${REPLACED}" ]; then
     # A replaced node's identity is gone with its disk, so the layout would
