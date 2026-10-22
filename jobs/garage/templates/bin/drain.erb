@@ -25,15 +25,16 @@
 #      layout, so a stable layout alone does not mean the blocks have left.
 #
 # Any refusal before the apply drops the staged removal and leaves the layout
-# as it was. The one exception is a drain that stalled for so long that its
-# lock may have passed to another departing node, whose own removal may be
-# staged by now. That drain leaves its removal staged, and the next drain
-# drops it once the stalled drain's lock token has expired. A node whose role
-# is already gone, because an earlier drain timed out or an operator removed
-# it by hand, goes straight to step 4, so a second deploy picks up where the
-# first one stopped. Drain keeps the lock
-# until the layout without this node has settled, and then lets the next
-# departing node go while it waits for its own blocks to leave.
+# as it was. The one exception is a drain that cannot confirm it still holds
+# the lock, because it stalled or its token was deleted, since the lock may
+# have passed to another departing node whose own removal may be staged by
+# now. That drain leaves its removal staged, and the next drain to take the
+# lock drops it. A node whose role is already gone, because an earlier drain
+# timed out or an operator removed it by hand, goes straight to step 4, so a
+# second deploy picks up where the first one stopped. Drain keeps the lock
+# until every node reports that the layout without this node has settled,
+# and then lets the next departing node go while it waits for its own blocks
+# to leave.
 #
 # On any other stop or update, drain waits for the node's block resync queue
 # to empty, for up to two minutes, so blocks still in flight to other nodes
@@ -66,8 +67,20 @@ RESYNC_WAIT_SECS=120
 # How long a lock token lives without a renewal, and how long a departing
 # node waits for the departure lock before it refuses.
 LOCK_TTL_SECS=300
+# The wait restarts whenever a node that held or wanted the lock lets it go,
+# so a long queue of departing nodes never runs out of time while it moves.
 LOCK_WAIT_SECS=1800
 LOCK_NAME_PREFIX="garage-drain-lock"
+# The largest difference drain accepts between this node's clock and any
+# peer's. The lock comment below explains why it matters.
+MAX_SKEW_SECS=30
+# The departure lock relies on quorum reads of the admin token table, which
+# only the consistent mode makes. Every node runs the mode of the last
+# deploy, because BOSH deletes departing instances before it updates the rest.
+CONSISTENCY_MODE="<%= p('garage.consistency_mode') %>"
+# Held for the whole removal, so that a second drain on this node, for
+# example after a cancelled BOSH task, never works alongside the first.
+DRAIN_LOCK_FILE=/var/vcap/data/garage/drain.lock
 
 log() { echo "[drain] $*" >&2; }
 
@@ -79,14 +92,20 @@ TMP_DIR=$(mktemp -d)
 STAGING=false
 # The id of this drain's departure lock token while it has one.
 LOCK_ID=""
+# Set once Garage has shown that LOCK_ID is gone or expired, which means
+# another drain may hold the lock and may have staged its own removal.
+LOCK_LOST=false
 on_exit() {
   local rc=$? out
-  if [ "${STAGING}" = "true" ] && ! lock_fresh; then
-    # A revert drops every staged change, and another drain may hold the
-    # lock by now and have staged its own removal. The next drain drops this
-    # one's leftover removal once it finds this drain's token expired, so the
-    # token stays in place rather than being deleted.
-    log "WARNING: stopped before applying its staged removal, but no longer holds the departure lock, so it leaves the removal staged. The next drain to take the lock, on another departing node or on this one in the next deploy, drops it once lock token ${LOCK_ID} has expired."
+  # A revert drops every staged change, so drain reverts only after Garage
+  # has confirmed once more that this drain's token is live.
+  if [ "${STAGING}" = "true" ] && ! renew_lock; then
+    # Another drain may hold the lock by now and have staged its own
+    # removal. A later holder that saw this drain's token, or the next drain
+    # on this node, drops this one's leftover removal once the token is
+    # gone, so the token stays in place and expires rather than being
+    # deleted.
+    log "WARNING: stopped before applying its staged removal, but cannot confirm that it still holds the departure lock (${READ_ERROR}), so it leaves the removal staged. A drain on another departing node that saw lock token ${LOCK_ID:-<none>}, or the next drain on this node, drops it once that token is gone. Any other drain refuses until the removal is applied or dropped by hand with \`garage layout revert --yes\`."
     LOCK_ID=""
   elif [ "${STAGING}" = "true" ]; then
     log "stopped before applying its staged removal, so it drops it with \`garage layout revert --yes\`."
@@ -186,20 +205,85 @@ read_cluster() {
     $1 ~ /^nodes\.[0-9]+\.isUp$/ { split($1, p, "."); up[p[2]] = $3 }
     $1 ~ /^nodes\.[0-9]+\.role\.zone$/ { split($1, p, "."); role[p[2]] = 1 }
     END { for (k in role) if (up[k] != "true") print substr(id[k], 1, 16) }' "${S}" | paste -sd ' ' -)
+  PEERS=$(awk -F'\t' -v self="${SELF_ID:-}" '
+    $1 ~ /^nodes\.[0-9]+\.id$/ { split($1, p, "."); id[p[2]] = $3 }
+    $1 ~ /^nodes\.[0-9]+\.isUp$/ { split($1, p, "."); up[p[2]] = $3 }
+    $1 ~ /^nodes\.[0-9]+\.addr$/ && $2 == "s" { split($1, p, "."); addr[p[2]] = $3 }
+    END { for (k in id) if (id[k] != self && up[k] == "true" && addr[k] != "") print id[k], addr[k] }' "${S}")
   return 0
+}
+
+# ── peers ────────────────────────────────────────────────────────────────────
+# PEERS (from read_cluster) holds one "id rpc-address" line for every other
+# node that is up. Their admin APIs listen on the same address, as post-deploy
+# already relies on.
+peer_admin_url() { echo "http://$(host_port "$(strip_port "$1")" "${ADMIN_PORT}")"; }
+
+# Refuses when this node's clock and a peer's differ by more than
+# MAX_SKEW_SECS, judged by the Date header of the peer's unauthenticated
+# /health endpoint. A peer that does not answer is skipped with a warning,
+# because the check narrows a race and is not what makes the lock safe.
+check_clock_skew() {
+  local id addr hdr="${TMP_DIR}/health.headers" before after peer_time skew worst=0
+  while read -r id addr; do
+    [ -n "${id}" ] || continue
+    before=$(date +%s)
+    if ! curl --silent --max-time 5 --output /dev/null --dump-header "${hdr}" \
+      "$(peer_admin_url "${addr}")/health" 2>/dev/null; then
+      log "WARNING: could not reach the admin API of node ${id:0:16} at ${addr} to compare clocks."
+      continue
+    fi
+    after=$(date +%s)
+    peer_time=$(awk 'tolower($1) == "date:" { sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); print; exit }' "${hdr}")
+    if ! peer_time=$(date -u -d "${peer_time}" +%s 2>/dev/null); then
+      log "WARNING: node ${id:0:16} sent no readable Date header, so drain cannot compare clocks with it."
+      continue
+    fi
+    skew=$(( peer_time - (before + after) / 2 ))
+    skew=${skew#-}
+    [ "${skew}" -gt "${worst}" ] && worst=${skew}
+    if [ "${skew}" -gt "${MAX_SKEW_SECS}" ]; then
+      refuse "the clock of node ${id:0:16} differs from this node's by about ${skew}s, more than the ${MAX_SKEW_SECS}s the departure lock tolerates, because Garage judges a lock token's expiry by the clock of the node that reads it. Fix the time synchronisation and deploy again."
+    fi
+  done <<< "${PEERS}"
+  log "the clocks of the nodes that answered agree within about ${worst}s."
+}
+
+# Succeeds when every peer that is up reports a single live layout version,
+# as this node does. A peer that does not answer counts as not settled.
+peers_settled() {
+  local id addr body="${TMP_DIR}/peer-history.json" flat="${TMP_DIR}/peer-history.flat" code live
+  while read -r id addr; do
+    [ -n "${id}" ] || continue
+    code=$(admin_request "${body}" "$(peer_admin_url "${addr}")/v2/GetClusterLayoutHistory")
+    [ "${code}" = "200" ] || return 1
+    json_flatten < "${body}" > "${flat}" 2>/dev/null || return 1
+    live=$(awk -F'\t' '$1 ~ /^versions\.[0-9]+\.status$/ && $3 != "Historical" { n++ } END { print n + 0 }' "${flat}")
+    [ "${live}" = "1" ] || return 1
+  done <<< "${PEERS}"
 }
 
 holds_role() { grep -qxF "$1" <<< "${ROLES}"; }
 
 # Succeeds when every staged role change is the removal of a node whose
-# drain stopped while it held the departure lock, so that the removal is a
-# leftover nobody will apply.
+# drain no longer holds the departure lock, so that the removal is a
+# leftover nobody will apply. Only the holder calls this, after it has
+# renewed its token. Such a node is either this one, whose earlier drain
+# cannot still be running while this drain holds DRAIN_LOCK_FILE, or a node
+# whose lock token this drain has seen and which has no token now. A drain
+# stages only while it holds the lock, so a node without a token cannot
+# apply. A staged removal of any other node may be an operator's, and is
+# never dropped.
 staged_by_stale_holders() {
   local id
+  list_locks || return 1
   while IFS= read -r id; do
     [ -n "${id}" ] || continue
     grep -qxF "${id}" <<< "${STAGED_REMOVALS}" || return 1
-    grep -qxF "${id}" <<< "${STALE_HOLDERS}" || return 1
+    [ "${id}" = "${SELF_ID}" ] || grep -qxF "${id}" <<< "${LOCK_NODES_SEEN}" || return 1
+    if awk -v n="${id}" -v mine="${LOCK_ID}" '$1 != mine && $2 == n && $3 == "live" { found = 1 } END { exit !found }' <<< "${LOCKS}"; then
+      return 1
+    fi
   done <<< "${STAGED_IDS}"
 }
 role_count() { awk 'NF' <<< "${ROLES}" | wc -l | tr -d ' '; }
@@ -233,8 +317,14 @@ local_stat() {
 # every node stores, and in the consistent mode it writes and reads that
 # table with overlapping quorums, so a listing that starts after a create
 # has returned always shows the new token. The degraded and dangerous modes
-# read that table from a single node, so there the lock only narrows the
-# race, and the deployment must drain one node at a time.
+# read that table from a single node, so there the deployment must drain one
+# node at a time, and a drain in those modes refuses as soon as it sees
+# another node's live token rather than waiting for it.
+#
+# The quorums overlap only while the nodes agree on which layout versions
+# are live. The holder therefore keeps the lock after its apply until every
+# node reports a single live version, so that the lock never changes hands
+# while some nodes still read the old version and others do not.
 #
 # The rule is Burns' mutual exclusion, ordered by node id. A drain creates
 # its token only while no live token with a lower node id exists, and then
@@ -255,13 +345,37 @@ local_stat() {
 # is done, or belongs to a dead drain and expires. A drain also deletes a
 # token that expired, because the drain that made it stopped renewing it,
 # and an older token of its own node, which only a killed earlier drain on
-# this node can have left. A crashed drain therefore holds up the others for
-# LOCK_TTL_SECS at most, and every wait ends after LOCK_WAIT_SECS with a
-# refusal that leaves nothing staged.
+# this node can have left, since DRAIN_LOCK_FILE keeps a second drain from
+# running beside the first. A crashed drain therefore holds up the others
+# for LOCK_TTL_SECS at most, and a wait ends with a refusal that leaves
+# nothing staged once LOCK_WAIT_SECS pass without any other node letting the
+# lock go.
+#
+# Garage judges whether a token has expired by the clock of the node that
+# reads it, and the drain that renews it sets the expiration by its own
+# clock. A renewal starts only while the last confirmed one is younger than
+# three fifths of LOCK_TTL_SECS, 180s. It reads the token, pushes its
+# expiration forward, and reads it again, with each call limited to 10s, so
+# the push lands while the token still has 100s left by this node's clock.
+# Another drain can therefore find the token expired too early only when its
+# node's clock runs 100s or more ahead of this one's, and drain refuses to
+# start when any peer's clock differs from its own by more than
+# MAX_SKEW_SECS. A renewal counts only when the second read still finds the
+# token live, because Garage answers an update of a token that another drain
+# deleted a moment earlier with success and keeps it deleted.
+#
+# The lock is a lease without a fencing token. A holder that pauses for
+# longer than LOCK_TTL_SECS between a confirmed renewal and the layout change
+# that follows it can make that change while the next holder works. The
+# settle check before every apply, which refuses unless this node's removal
+# is the only staged change and the layout version has not moved, is the
+# guard for that case, and the check after the apply reports any other node
+# that left the layout in the same version.
 LOCK_RENEWED=0
-# Node ids, one per line, of drains whose expired or orphaned token this
-# drain deleted. A removal that only such a drain staged is safe to drop.
-STALE_HOLDERS=""
+# Node ids, one per line, of every node whose lock token this drain has seen.
+# Once this drain holds the lock, a removal that only such nodes staged, and
+# whose tokens are gone, is a leftover that nobody will apply.
+LOCK_NODES_SEEN=""
 
 # Prints an RFC 3339 time LOCK_TTL_SECS from now.
 lock_expiration() {
@@ -332,6 +446,7 @@ create_lock() {
     return 1
   fi
   LOCK_ID="${id}"
+  LOCK_LOST=false
   LOCK_RENEWED=${started}
   # Garage gives a token every endpoint unless the request names a scope.
   # A lock token must grant nothing, so one with any scope is deleted again.
@@ -342,28 +457,99 @@ create_lock() {
   fi
 }
 
-# Pushes this drain's token expiration forward. Fails when the token is gone,
-# which means another drain found it expired and took the lock, and also
-# without asking Garage when the last renewal is so old that the token may
-# have expired. Renewing an expired token would bring it back to life after
-# another drain had already counted it as dead. Drain renews just before
-# every layout change it makes, so it fails rather than change the layout
-# without the lock.
-renew_lock() {
-  local started=${SECONDS}
-  [ -n "${LOCK_ID}" ] || return 1
-  if ! lock_fresh; then
-    READ_ERROR="the lock token was last renewed $((SECONDS - LOCK_RENEWED))s ago, so it may have expired and another drain may hold the lock"
+# Sets TOKEN_STATE to live, expired, or gone for the token with the given id,
+# as a quorum read through the local node sees it. Returns non-zero with
+# READ_ERROR set when Garage gives no clear answer.
+TOKEN_STATE=""
+token_state() {
+  local flat="${TMP_DIR}/token.flat" expired
+  TOKEN_STATE=""
+  if ! fetch_flat "GetAdminTokenInfo?id=$1" "${flat}"; then
+    case "${READ_ERROR}" in *"HTTP 404"*) TOKEN_STATE=gone; return 0 ;; esac
     return 1
   fi
-  admin_post "UpdateAdminToken?id=${LOCK_ID}" "{\"expiration\":\"$(lock_expiration)\"}" || return 1
-  LOCK_RENEWED=${started}
+  if ! awk -F'\t' -v want="$1" '$1 == "id" && $3 == want { found = 1 } END { exit !found }' "${flat}"; then
+    READ_ERROR="GetAdminTokenInfo answered for a token other than $1"
+    return 1
+  fi
+  expired=$(awk -F'\t' '$1 == "expired" { print $3; exit }' "${flat}")
+  case "${expired}" in
+    true)  TOKEN_STATE=expired ;;
+    false) TOKEN_STATE=live ;;
+    *)     READ_ERROR="GetAdminTokenInfo did not say whether token $1 has expired"; return 1 ;;
+  esac
 }
 
-# Succeeds while this drain has a token and renewed it recently enough that
-# no other drain can have found it expired, even with some clock skew.
+# Pushes this drain's token expiration forward and confirms that the token
+# is still live afterwards. It fails without asking Garage once the last
+# confirmed renewal is too old for the token to be live for certain, and it
+# sets LOCK_LOST when Garage shows the token gone or expired, because then
+# another drain may hold the lock. It never renews an expired token, which
+# would bring it back to life after another drain had already counted it as
+# dead. A failed admin API call is tried again twice while the lock is
+# still fresh. Drain renews just before every layout change it makes, so it
+# fails rather than change the layout without the lock.
+renew_lock() {
+  local attempt started
+  if [ -z "${LOCK_ID}" ]; then
+    READ_ERROR="this drain holds no lock token"
+    return 1
+  fi
+  if [ "${LOCK_LOST}" = "true" ]; then
+    READ_ERROR="Garage already showed that this drain lost the departure lock"
+    return 1
+  fi
+  for attempt in 1 2 3; do
+    [ "${attempt}" = "1" ] || sleep 2
+    started=${SECONDS}
+    if ! lock_fresh; then
+      READ_ERROR="the lock token was last renewed $((SECONDS - LOCK_RENEWED))s ago, so it may have expired and another drain may hold the lock"
+      LOCK_LOST=true
+      return 1
+    fi
+    if renew_once; then
+      LOCK_RENEWED=${started}
+      return 0
+    fi
+    [ "${LOCK_LOST}" = "true" ] && return 1
+  done
+  return 1
+}
+
+renew_once() {
+  token_state "${LOCK_ID}" || return 1
+  if [ "${TOKEN_STATE}" != "live" ]; then
+    READ_ERROR="lock token ${LOCK_ID} is ${TOKEN_STATE}, so another drain may hold the lock"
+    LOCK_LOST=true
+    return 1
+  fi
+  if ! admin_post "UpdateAdminToken?id=${LOCK_ID}" "{\"expiration\":\"$(lock_expiration)\"}"; then
+    case "${READ_ERROR}" in *"HTTP 404"*) LOCK_LOST=true ;; esac
+    return 1
+  fi
+  token_state "${LOCK_ID}" || return 1
+  if [ "${TOKEN_STATE}" != "live" ]; then
+    READ_ERROR="lock token ${LOCK_ID} is ${TOKEN_STATE} right after its renewal, so another drain deleted it and may hold the lock"
+    LOCK_LOST=true
+    return 1
+  fi
+}
+
+# Succeeds while this drain has a token that Garage has not shown to be lost,
+# and its last confirmed renewal is younger than three fifths of
+# LOCK_TTL_SECS. Bash's SECONDS follows the wall clock, so a pause that this
+# node's clock does not count is caught by the clock check before every
+# layout change instead.
 lock_fresh() {
-  [ -n "${LOCK_ID}" ] && [ $((SECONDS - LOCK_RENEWED)) -lt $((LOCK_TTL_SECS * 4 / 5)) ]
+  [ -n "${LOCK_ID}" ] && [ "${LOCK_LOST}" != "true" ] \
+    && [ $((SECONDS - LOCK_RENEWED)) -lt $((LOCK_TTL_SECS * 3 / 5)) ]
+}
+
+# Forgets this drain's token without deleting it. The next listing deletes
+# it as an older token of this node.
+forget_lock() {
+  LOCK_ID=""
+  LOCK_LOST=false
 }
 
 release_lock() {
@@ -373,18 +559,18 @@ release_lock() {
   else
     log "WARNING: could not delete the departure lock token ${LOCK_ID} (${READ_ERROR}). It expires on its own within ${LOCK_TTL_SECS}s."
   fi
-  LOCK_ID=""
+  forget_lock
 }
 
 lock_sleep() { sleep $((8 + RANDOM % 5)); }
 
 acquire_lock() {
-  local start=${SECONDS} last_log=-60 id node state lower higher mine waiting_on
+  local start=${SECONDS} since=${SECONDS} last_log=-60 id node state lower higher others prev_others="" n mine waiting_on=""
   log "taking the departure lock, so that only one departing node at a time changes the layout."
   while :; do
-    if [ $((SECONDS - start)) -ge "${LOCK_WAIT_SECS}" ]; then
+    if [ $((SECONDS - since)) -ge "${LOCK_WAIT_SECS}" ]; then
       release_lock
-      refuse "node ${SELF} waited ${LOCK_WAIT_SECS}s for the departure lock, which node(s)${waiting_on:- unknown} still hold. Nothing is staged and the layout is unchanged. Deploy again once they have left the layout. \`garage admin-token list\` shows the lock tokens, and a token whose drain is gone expires within ${LOCK_TTL_SECS}s."
+      refuse "node ${SELF} waited ${LOCK_WAIT_SECS}s for the departure lock without any other node letting it go, and node(s)${waiting_on:- unknown} still hold or want it. Nothing is staged and the layout is unchanged. Deploy again once they have left the layout. \`garage admin-token list\` shows the lock tokens, and a token whose drain is gone expires within ${LOCK_TTL_SECS}s."
     fi
     if ! list_locks; then
       log "could not list the departure lock tokens (${READ_ERROR}); trying again."
@@ -395,6 +581,7 @@ acquire_lock() {
 
     lower=""
     higher=""
+    others=""
     mine=false
     while read -r id node state; do
       [ -n "${id}" ] || continue
@@ -402,23 +589,40 @@ acquire_lock() {
         # An expired token of its own means this drain stalled for longer
         # than LOCK_TTL_SECS, and another drain may have taken the lock.
         [ "${state}" = "live" ] && mine=true
-      elif [ "${node}" = "${SELF_ID}" ] || [ "${state}" = "expired" ]; then
+        continue
+      fi
+      grep -qxF "${node}" <<< "${LOCK_NODES_SEEN}" \
+        || LOCK_NODES_SEEN=$(printf '%s\n%s' "${LOCK_NODES_SEEN}" "${node}")
+      if [ "${node}" = "${SELF_ID}" ] || [ "${state}" = "expired" ]; then
         if [ "${node}" = "${SELF_ID}" ]; then
           log "deleting lock token ${id}, which an earlier drain on this node left behind."
         else
           log "deleting lock token ${id} of node ${node:0:16}, which expired, so the drain that made it has stopped."
         fi
-        if delete_token "${id}"; then
-          STALE_HOLDERS=$(printf '%s\n%s' "${STALE_HOLDERS}" "${node}")
-        else
-          log "WARNING: could not delete lock token ${id} (${READ_ERROR})."
-        fi
+        delete_token "${id}" || log "WARNING: could not delete lock token ${id} (${READ_ERROR})."
       elif [[ "${node}" < "${SELF_ID}" ]]; then
         lower="${lower} ${node:0:16}"
+        others="${others} ${node}"
       else
         higher="${higher} ${node:0:16}"
+        others="${others} ${node}"
       fi
     done <<< "${LOCKS}"
+
+    # The wait starts over whenever a node that held or wanted the lock has
+    # let it go, because the queue is moving.
+    for n in ${prev_others}; do
+      case " ${others} " in
+        *" ${n} "*) ;;
+        *) since=${SECONDS}; break ;;
+      esac
+    done
+    prev_others="${others}"
+
+    if [ -n "${others}" ] && [ "${CONSISTENCY_MODE}" != "consistent" ]; then
+      release_lock
+      refuse "node(s)${lower}${higher} also want the departure lock, but this cluster runs in the ${CONSISTENCY_MODE} consistency mode, in which Garage reads the lock tokens from a single node, so the lock cannot keep two departing nodes apart. Nothing is staged and the layout is unchanged. Deploy the scale-down with max_in_flight: 1, or move the cluster to the consistent mode at the same instance count first."
+    fi
 
     if [ -n "${lower}" ]; then
       waiting_on="${lower}"
@@ -432,10 +636,10 @@ acquire_lock() {
       [ -n "${LOCK_ID}" ] && continue
     elif [ "${mine}" != "true" ]; then
       log "WARNING: lock token ${LOCK_ID} is missing from the listing or has expired, so this drain makes a new one."
-      LOCK_ID=""
+      forget_lock
     elif ! renew_lock; then
       log "could not renew lock token ${LOCK_ID} (${READ_ERROR}), so this drain makes a new one."
-      LOCK_ID=""
+      forget_lock
     elif [ -n "${higher}" ]; then
       waiting_on="${higher}"
     else
@@ -444,7 +648,7 @@ acquire_lock() {
     fi
 
     if [ $((SECONDS - start - last_log)) -ge 60 ]; then
-      log "  $((SECONDS - start))s: waiting for the departure lock, which node(s)${waiting_on} hold or want."
+      log "  $((SECONDS - start))s: waiting for the departure lock, which node(s)${waiting_on:- unknown} hold or want."
       last_log=$((SECONDS - start))
     fi
     lock_sleep
@@ -453,7 +657,7 @@ acquire_lock() {
 
 # ── take this node out of the layout ─────────────────────────────────────────
 remove_self() {
-  local start out count
+  local start out count base_roles gone
 
   start=${SECONDS}
   while [ "${LIVE_VERSIONS}" -gt 1 ]; do
@@ -466,13 +670,15 @@ remove_self() {
     read_cluster || refuse "could not read the cluster state: ${READ_ERROR}"
   done
 
-  if [ -n "${STAGED_IDS}" ] && [ -z "${STAGED_PARAMS}" ] && staged_by_stale_holders; then
-    log "the only staged changes are the removal of node(s) $(awk 'NF { printf "%s ", substr($0, 1, 16) }' <<< "${STAGED_IDS}")whose drain stopped while it held the departure lock, so drain drops them with \`garage layout revert --yes\`."
-    renew_lock || refuse "lost the departure lock before dropping the staged changes: ${READ_ERROR}"
-    if ! out=$(garage_cli layout revert --yes 2>&1); then
-      refuse "\`garage layout revert --yes\` failed: ${out}"
+  if [ -n "${STAGED_IDS}" ] && [ -z "${STAGED_PARAMS}" ]; then
+    renew_lock || refuse "lost the departure lock before checking the staged changes: ${READ_ERROR}"
+    if staged_by_stale_holders; then
+      log "the only staged changes are the removal of node(s) $(awk 'NF { printf "%s ", substr($0, 1, 16) }' <<< "${STAGED_IDS}")whose drain no longer holds the departure lock, so drain drops them with \`garage layout revert --yes\`."
+      if ! out=$(garage_cli layout revert --yes 2>&1); then
+        refuse "\`garage layout revert --yes\` failed: ${out}"
+      fi
+      read_cluster || refuse "could not read the cluster state: ${READ_ERROR}"
     fi
-    read_cluster || refuse "could not read the cluster state: ${READ_ERROR}"
   fi
 
   if [ -n "${STAGED_IDS}" ] || [ -n "${STAGED_PARAMS}" ]; then
@@ -488,13 +694,25 @@ remove_self() {
 
   BASE_VERSION="${LAYOUT_VERSION}"
   NEXT_VERSION=$((BASE_VERSION + 1))
+  base_roles="${ROLES}"
   log "staging the removal of node ${SELF} from layout version ${BASE_VERSION} (${count} roles, replication factor ${RENDERED_RF})."
+  check_clock_skew
   renew_lock || refuse "lost the departure lock before staging the removal: ${READ_ERROR}"
   STAGING=true
   if ! out=$(garage_cli layout remove "${SELF_ID}" 2>&1); then
     refuse "\`garage layout remove ${SELF}\` failed: ${out}"
   fi
 
+  # The settle check. Garage gossips staged changes to every node within a
+  # few seconds, so when two drains both believe they hold the lock and stage
+  # within SETTLE_SECS of each other, each one sees the other's removal here
+  # and refuses. A drain that comes later than that finds the first drain's
+  # staged removal, or the version it applied, before it stages anything. It
+  # refuses or waits, or it drops the removal when the first drain's token is
+  # gone, and then the first drain's settle check or its next renewal makes
+  # it refuse. This check is the last guard against a double holder,
+  # whatever caused it, and only a drain that pauses between this check and
+  # its apply can get past it.
   sleep "${SETTLE_SECS}"
   read_cluster || refuse "could not read the cluster state after staging the removal: ${READ_ERROR}"
   if [ "${LAYOUT_VERSION}" != "${BASE_VERSION}" ]; then
@@ -504,10 +722,20 @@ remove_self() {
     refuse "the staged layout changes are not only this node's removal, so something else is changing the layout. Drain never applies a change it did not make. Run \`garage layout show\` to see them, and deploy again once they are gone."
   fi
 
+  check_clock_skew
   renew_lock || refuse "lost the departure lock before applying the removal: ${READ_ERROR}"
   log "applying layout version ${NEXT_VERSION} without node ${SELF}..."
   if ! out=$(garage_cli layout apply --version "${NEXT_VERSION}" 2>&1); then
-    refuse "\`garage layout apply --version ${NEXT_VERSION}\` failed, so the removal is dropped and the layout stays at version ${BASE_VERSION}: ${out}"
+    # The CLI gives up after GARAGE_CLI_TIMEOUT, but the node may still
+    # finish the apply, so drain looks before it reports what happened.
+    log "\`garage layout apply --version ${NEXT_VERSION}\` failed: ${out}"
+    sleep 5
+    if read_cluster && [ "${LAYOUT_VERSION}" = "${NEXT_VERSION}" ] && ! holds_role "${SELF_ID}"; then
+      log "the layout reached version ${NEXT_VERSION} without node ${SELF} all the same, so Garage applied the removal after the CLI gave up."
+      out=""
+    else
+      refuse "\`garage layout apply --version ${NEXT_VERSION}\` failed, and the layout is at version ${LAYOUT_VERSION} with node ${SELF} still in it as far as drain can read, so the removal was not applied. Drain drops the staged removal on exit while it still holds the lock."
+    fi
   fi
   STAGING=false
   while IFS= read -r line; do [ -z "${line}" ] || log "  ${line}"; done <<< "${out}"
@@ -515,6 +743,15 @@ remove_self() {
   read_cluster || refuse "applied layout version ${NEXT_VERSION}, but could not read it back: ${READ_ERROR}. Deploy again; drain then waits for this node's data to move."
   if holds_role "${SELF_ID}"; then
     refuse "applied layout version ${NEXT_VERSION}, but node ${SELF} still holds a role in it. Check \`garage layout show\`."
+  fi
+  # Only a holder that paused past the lock's lifetime can have staged a
+  # second removal after the settle check. Nothing is lost when that
+  # happens, because the other node holds no role and keeps running until
+  # its data has moved, but the change was meant to remove one node.
+  gone=$(awk -v self="${SELF_ID}" 'NR == FNR { if (NF) now[$0] = 1; next } NF && !($0 in now) && $0 != self { printf " %s", substr($0, 1, 16) }' \
+    <(printf '%s\n' "${ROLES}") <(printf '%s\n' "${base_roles}"))
+  if [ -n "${gone}" ]; then
+    log "WARNING: layout version ${NEXT_VERSION} also removed node(s)${gone}, which another drain must have staged after this one checked the staged changes. Those nodes hold no role and keep running until their data has moved, so nothing is lost. Check \`garage layout history\`."
   fi
   log "applied layout version ${NEXT_VERSION}; node ${SELF} no longer holds a role."
 }
@@ -534,15 +771,17 @@ wait_until_offloaded() {
       log "could not read the cluster state (${READ_ERROR}); trying again."
       LIVE_VERSIONS=unknown
     fi
-    # The departure lock goes to the next departing node once the layout
-    # without this node has settled, or once STABLE_WAIT_SECS have passed,
-    # because the next drain waits for a stable layout itself.
+    # The departure lock goes to the next departing node once every node
+    # reports that the layout without this node has settled, so that the
+    # lock never changes hands while the nodes disagree about which layout
+    # versions are live. After STABLE_WAIT_SECS it goes anyway, because the
+    # next drain waits for a stable layout itself.
     if [ -n "${LOCK_ID}" ]; then
-      if [ "${LIVE_VERSIONS}" = "1" ] || [ "${elapsed}" -ge "${STABLE_WAIT_SECS}" ]; then
+      if { [ "${LIVE_VERSIONS}" = "1" ] && peers_settled; } || [ "${elapsed}" -ge "${STABLE_WAIT_SECS}" ]; then
         release_lock
       elif ! renew_lock; then
         log "WARNING: could not renew the departure lock (${READ_ERROR}). The removal is applied, so drain lets the lock go and keeps waiting."
-        LOCK_ID=""
+        release_lock
       fi
     fi
     queue=$(local_stat 'resync queue length')
@@ -594,6 +833,11 @@ fi
 if [ "${NEXT_INSTANCE}" = "delete" ] || [ "${NEXT_DISK}" = "0" ]; then
   log "BOSH is deleting this instance (next instance state: ${NEXT_INSTANCE}, next persistent disk size: ${NEXT_DISK:-unknown})."
   SELF=""
+  mkdir -p "$(dirname "${DRAIN_LOCK_FILE}")"
+  exec 9>> "${DRAIN_LOCK_FILE}"
+  if ! flock -n 9; then
+    refuse "another drain is still running on this instance, for example one that a cancelled BOSH task left behind, and two drains on one node would work against each other. Wait until it has finished, or stop it, and deploy again."
+  fi
   if ! process_running; then
     refuse "the garage process is not running, so drain cannot check whether this node still holds a layout role or data."
   fi
@@ -611,6 +855,7 @@ if [ "${NEXT_INSTANCE}" = "delete" ] || [ "${NEXT_DISK}" = "0" ]; then
       echo 0
       exit 0
     fi
+    check_clock_skew
     acquire_lock
     # Another departing node may have changed the layout while this one
     # waited for the lock.

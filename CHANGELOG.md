@@ -2,6 +2,24 @@
 
 All notable changes to garage-boshrelease are documented here.
 
+## 0.2.3 (2026-10-22)
+
+### Fixed
+
+- `jobs/garage` drain: a drain that waited for the departure lock while another node held it crashed under `set -u` on its first retry, because the list of nodes it waited on was never declared. It now waits as intended.
+- `jobs/garage` drain: a drain that has lost the departure lock, because Garage shows its token gone or expired or its last renewal is too old, no longer runs `garage layout revert --yes` on its way out. The revert drops every staged change, so it could undo the removal that the next holder had already staged. The drain now leaves its own removal staged, and the next holder that saw its token drops it.
+- `jobs/garage` drain: every renewal of the lock token reads the token again afterwards and counts only when it is still live, because Garage answers an update of a token that another drain has just deleted with success. A renewal starts only while the last confirmed one is younger than three minutes.
+- `jobs/garage` drain: the holder drops a staged removal only when every staged change is the removal of its own node or of a node whose lock token it saw earlier and which has no live token now. Before, a removal staged by a drain that was still running but whose token another drain had deleted could be dropped.
+- `jobs/garage` drain: the holder keeps the departure lock until every node that is up reports the new layout as its single live version, so the next holder never stages against a node that has not caught up.
+- `jobs/garage` drain: a wait for the lock now refuses only after 30 minutes pass without any other departing node letting the lock go, so a long queue of departing nodes no longer runs out of time while it moves.
+- `jobs/garage` drain: when `garage layout apply` fails, drain reads the layout again and goes on when the new version already holds no role for its node, and otherwise refuses with a message that gives the version it read. After an apply, it warns when another node left the layout in the same version.
+
+### Added
+
+- `jobs/garage` drain: drain refuses to start when another node's clock differs from its own by more than 30 seconds, and it checks again before it stages and before it applies, because Garage judges a token's expiry by the clock of the node that reads it.
+- `jobs/garage` drain: outside the `consistent` mode, a drain refuses with nothing staged as soon as it sees that another departing node wants the lock, because Garage then reads the lock tokens from a single node.
+- `jobs/garage` drain: a second drain on the same instance refuses at once, through a `flock` on `/var/vcap/data/garage/drain.lock`.
+
 ## 0.2.2 (2026-10-22)
 
 ### Changed
