@@ -730,7 +730,9 @@ remove_self() {
     # finish the apply, so drain looks before it reports what happened.
     log "\`garage layout apply --version ${NEXT_VERSION}\` failed: ${out}"
     sleep 5
-    if read_cluster && [ "${LAYOUT_VERSION}" = "${NEXT_VERSION}" ] && ! holds_role "${SELF_ID}"; then
+    if ! read_cluster; then
+      refuse "\`garage layout apply --version ${NEXT_VERSION}\` failed, and drain could not read the layout afterwards (${READ_ERROR}), so it cannot tell whether Garage applied the removal. Drain drops the staged removal on exit while it still holds the lock, which changes nothing if the apply went through. Deploy again; drain then finds out which case it is in."
+    elif [ "${LAYOUT_VERSION}" = "${NEXT_VERSION}" ] && ! holds_role "${SELF_ID}"; then
       log "the layout reached version ${NEXT_VERSION} without node ${SELF} all the same, so Garage applied the removal after the CLI gave up."
       out=""
     else
