@@ -12,7 +12,7 @@ All notable changes to garage-boshrelease are documented here.
 - `jobs/garage` drain: the holder drops a staged removal only when every staged change is the removal of its own node or of a node whose lock token it saw earlier and which has no live token now. Before, a removal staged by a drain that was still running but whose token another drain had deleted could be dropped.
 - `jobs/garage` drain: the holder keeps the departure lock until every node that is up reports the new layout as its single live version, so the next holder never stages against a node that has not caught up.
 - `jobs/garage` drain: a wait for the lock now refuses only after 30 minutes pass without any other departing node letting the lock go, so a long queue of departing nodes no longer runs out of time while it moves.
-- `jobs/garage` drain: when `garage layout apply` fails, drain reads the layout again and goes on when the new version already holds no role for its node, and otherwise refuses with a message that gives the version it read. After an apply, it warns when another node left the layout in the same version.
+- `jobs/garage` drain: when `garage layout apply` fails, drain reads the layout again and goes on when the new version already holds no role for its node, and otherwise refuses with a message that gives the version it read, or that says it could not read the layout at all. After an apply, it warns when another node left the layout in the same version.
 
 ### Added
 
