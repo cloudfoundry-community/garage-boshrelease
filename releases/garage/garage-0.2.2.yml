@@ -1,0 +1,27 @@
+name: garage
+version: 0.2.2
+commit_hash: 0fac8a4
+uncommitted_changes: false
+jobs:
+- name: garage
+  version: 2944ef4724dd1b8c333a572ff3a19e41678b6d74cb805ba0372132ee8d563589
+  fingerprint: 2944ef4724dd1b8c333a572ff3a19e41678b6d74cb805ba0372132ee8d563589
+  sha1: sha256:555ca501ed304bd955e39f7822d036d03a6aa66cf38f9890a55e3a9e43ed1fc8
+  packages:
+  - garage
+- name: smoke-tests
+  version: 1d04e7e1cb19e252d59267f9708f06e8baddaa08ee72e10d903127177559d464
+  fingerprint: 1d04e7e1cb19e252d59267f9708f06e8baddaa08ee72e10d903127177559d464
+  sha1: sha256:188a33e9a03f74fc314d019eba0ca73da3a2ac6f6c9ff74623a770c4c4fb4f21
+  packages: []
+packages:
+- name: garage
+  version: f466e2b0cf3d2ed0c3f7f983de72d6e05177499aca6e98940317b324c2888d77
+  fingerprint: f466e2b0cf3d2ed0c3f7f983de72d6e05177499aca6e98940317b324c2888d77
+  sha1: sha256:2776a30be1b5a2e6aeac4d1b86a3e02b404d4257af1b536ffcfaaca0a7c9dec4
+  dependencies: []
+license:
+  version: ce9247c6d7a19bcb102aa16ea3adce19911648fcfb55373bf7d4fbb9b6306005
+  fingerprint: ce9247c6d7a19bcb102aa16ea3adce19911648fcfb55373bf7d4fbb9b6306005
+  sha1: sha256:e62ac6261e8ee04e9567a8c68307145e6e0826a0d317fb1d95bad0186f395fbb
+no_compression: false
