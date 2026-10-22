@@ -184,21 +184,25 @@ A deployment that grows from one instance to several keeps its replication facto
 
 ### Scaling down
 
-We lower `instances` and deploy, and the garage job's drain script takes each departing node out of the cluster before BOSH deletes its disk. BOSH deletes the departing instances before it updates the remaining ones, and drain runs on each departing instance in turn.
+We lower `instances` and deploy, and the garage job's drain script takes each departing node out of the cluster before BOSH deletes its disk. BOSH deletes the departing instances before it updates the remaining ones, and it drains as many of them at once as `max_in_flight` allows.
 
-1. Drain checks that the layout is stable, that nothing is staged, that no node holding a role is down, and that the nodes left behind are still at least as many as the replication factor. When any check fails, drain refuses and the deploy stops with nothing changed.
+1. Drain takes the departure lock, so that only one departing node at a time changes the layout. The lock is described below.
 
-2. It stages `garage layout remove` for its own node, waits 15 seconds, and checks that its own removal is the only staged change and that the layout version hasn't moved. Otherwise it drops what it staged with `garage layout revert --yes` and refuses, so it never applies a change that someone else made.
+2. Drain checks that the layout is stable, that nothing is staged, that no node holding a role is down, and that the nodes left behind are still at least as many as the replication factor. When any check fails, drain refuses and the deploy stops with nothing changed.
 
-3. It applies the next layout version from its own node. When Garage rejects the new layout, for example because the remaining zones can't hold every copy, drain drops the staged removal and refuses.
+3. It stages `garage layout remove` for its own node, waits 15 seconds, and checks that its own removal is the only staged change and that the layout version hasn't moved. Otherwise it drops what it staged with `garage layout revert --yes` and refuses, so it never applies a change that someone else made.
 
-4. It waits until `garage layout history` reports a stable state with a single live layout version, and until the node's data directory holds no blocks and its resync queue is empty. Only then does BOSH stop the node and delete it.
+4. It applies the next layout version from its own node. When Garage rejects the new layout, for example because the remaining zones can't hold every copy, drain drops the staged removal and refuses.
+
+5. It waits until `garage layout history` reports a stable state with a single live layout version, and until the node's data directory holds no blocks and its resync queue is empty. Only then does BOSH stop the node and delete it.
 
 Garage doesn't track block moves in the layout. A layout can be stable while the departing node still holds the only copy of some blocks, and when `garage layout history` reports a stable state, it also says that block migration isn't tracked and that old nodes should stay online until their data directories are empty. So drain waits for the empty data directory as well. Garage starts deleting a block from a node that no longer stores it about ten minutes after the block's last reference has moved, which means each departing node takes at least ten to fifteen minutes even when it holds very little. When blocks are still left fifteen minutes after the layout settled and nothing is queued, drain queues every local block once with `garage repair --yes blocks`.
 
 Drain waits up to `garage.drain.delete_wait_secs`, an hour by default, for the data to move. When that runs out, it fails the deploy with what it's still waiting for. The node holds no role by then and keeps running, so nothing is lost, and the next deploy finds the role gone and goes straight back to waiting.
 
-BOSH must delete the departing instances one at a time, with `max_in_flight: 1`. Two drains that apply layout versions at the same moment would give Garage two different layouts with the same version number, which Garage can't reconcile. Each drain checks for a concurrent change before it applies, but a parallel scale-down is still unsafe, so we never scale down with `--max-in-flight` above 1 or with an update block that runs instances in parallel.
+Garage has no compare-and-swap for its layout, so two drains that applied layout versions at the same moment could give Garage two different layouts with the same version number, which Garage can't reconcile. Departing nodes therefore take turns. Each drain claims the lock with an admin token named `garage-drain-lock <node id>`, which grants no access and expires five minutes after its last renewal. Of the drains that want the lock, the one with the lowest node id goes first, and the others wait for it. The holder renews its token while it works, and it lets the lock go once the layout without its node has settled, so the next drain removes its node while the first one is still waiting for its blocks to leave. When a drain is killed, its token expires within five minutes, and the next drain deletes it and drops any removal the killed drain left staged. A drain that waits 30 minutes for the lock refuses with nothing staged, and the next deploy picks up where it stopped. `garage admin-token list` shows the lock tokens, and `garage admin-token delete --yes <id>` removes one by hand.
+
+The lock depends on the default `consistent` mode, in which Garage reads and writes admin tokens with overlapping quorums. In the `degraded` and `dangerous` modes, a drain can miss another drain's token, so those deployments scale down with `max_in_flight: 1`.
 
 A scale-down to a single instance works when the replication factor is 1. Drain removes every other node, and the last node keeps the cluster's layout and starts as plain `garage server`, because single-node mode refuses a layout that is past its first version. A cluster with a higher replication factor can't go below that many nodes, so it moves its data to a new single-node deployment instead.
 

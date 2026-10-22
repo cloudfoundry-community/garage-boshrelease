@@ -2,6 +2,12 @@
 
 All notable changes to garage-boshrelease are documented here.
 
+## 0.2.2 (2026-10-22)
+
+### Changed
+
+- `jobs/garage` drain: departing nodes take turns through a lock, so a scale-down is safe with any `max_in_flight`. Each drain claims the lock with an admin token named `garage-drain-lock <node id>`, which has no scope and expires five minutes after its last renewal, and the lowest node id goes first. The holder confirms and renews its token before every layout change and lets the lock go once the layout without its node has settled. A drain that finds an expired lock token deletes it and drops a removal that only the dead drain staged, and a drain that waits 30 minutes for the lock refuses with nothing staged. Before, two drains that ran at once could apply two different layouts under the same version, which Garage can't reconcile.
+
 ## 0.2.1 (2026-10-21)
 
 ### Changed
