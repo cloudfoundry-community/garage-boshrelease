@@ -1,33 +1,22 @@
 # garage-boshrelease
 
-A BOSH release that packages [Garage](https://garagehq.deuxfleurs.fr/) — a
-lightweight, S3-compatible distributed object storage system — as a
-BPM-managed service for Cloud Foundry and BOSH-based platforms.
+A BOSH release that packages [Garage](https://garagehq.deuxfleurs.fr/), a lightweight, S3-compatible distributed object storage system, as a BPM-managed service for Cloud Foundry and BOSH-based platforms.
 
 ## Overview
 
-Garage is a self-hosted, distributed object store built in Rust. It exposes an
-S3-compatible API on port 3900, an admin API on port 3903, and an RPC
-inter-node channel on port 3901. A single node binds the admin API to
-loopback. A cluster binds it to each instance's own IP, because the
-lifecycle hooks read each peer's node id and layout version from it. This
-release:
+Garage is a self-hosted, distributed object store built in Rust. It exposes an S3-compatible API on port 3900, an admin API on port 3903, and an RPC inter-node channel on port 3901. A single node binds the admin API to loopback. A cluster binds it to each instance's own IP, because the lifecycle hooks read each peer's node id and layout version from it. This release does the following.
 
-- Ships the statically-linked `x86_64-unknown-linux-musl` binary as a BOSH
-  blob — no compilation needed on the stemcell.
-- Manages the process under BPM with correct persistent disk, ephemeral
-  volume, and ulimit settings.
-- Uses a `garage-rpc` BOSH link so all instances enumerate peer IPs at
-  render time — no hard-coded peer list.
-- Bootstraps the cluster layout idempotently from the post-deploy hook on
-  the instance with the highest index (opt-out via
-  `garage.layout.manual: true`), replaces the role of a node that lost its
-  disk, and creates the root S3 key and the default bucket.
-- Refuses a change to the replication factor before it can lose anything,
-  and takes a node that BOSH is deleting out of the layout and waits until
-  its data lives on the remaining nodes.
-- Delivers `rpc_secret` and `admin_token` via on-disk files, not inline in
-  the TOML config, and keeps every secret off command lines.
+- Ships the statically linked `x86_64-unknown-linux-musl` binary as a BOSH blob, so the stemcell needs no compilation.
+
+- Manages the process under BPM with correct persistent disk, ephemeral volume, and ulimit settings.
+
+- Uses a `garage-rpc` BOSH link, so all instances enumerate peer IPs at render time and no peer list is hard-coded.
+
+- Bootstraps the cluster layout idempotently from the post-deploy hook on the instance with the highest index (opt out with `garage.layout.manual: true`), replaces the role of a node that lost its disk, and creates the root S3 key and the default bucket.
+
+- Refuses a change to the replication factor before it can lose anything, and takes a node that BOSH is deleting out of the layout and waits until its data lives on the remaining nodes.
+
+- Delivers `rpc_secret` and `admin_token` through on-disk files rather than inline in the TOML config, and keeps every secret off command lines.
 
 ## Requirements
 
@@ -39,8 +28,7 @@ release:
 | Persistent disk | 10 GiB+ (production: 100 GiB+) | One disk per instance; `meta/` should be SSD-backed |
 | Garage binary | v2.3.0 | Fetched by `scripts/fetch blobs` (or `make download-blobs`) |
 
-No runtime library dependencies: Garage's musl binary is fully statically
-linked and has no glibc or OpenSSL requirements on the stemcell.
+There are no runtime library dependencies, because Garage's musl binary is fully statically linked and has no glibc or OpenSSL requirements on the stemcell.
 
 ## Quickstart
 
@@ -119,8 +107,7 @@ bosh -d <deployment> run-errand smoke-tests
 | `garage.bpm.open_files` | `65536` | BPM open_files ulimit |
 | `smoke_tests.timeout_secs` | `30` | `curl --max-time` for smoke test requests |
 
-See `jobs/garage/spec` for complete property declarations with types and
-descriptions. Properties in the `smoke-tests` job mirror the main job.
+For complete property declarations with types and descriptions, see `jobs/garage/spec`. The properties in the `smoke-tests` job mirror those of the main job.
 
 ## Cluster Bootstrap
 
@@ -294,45 +281,47 @@ graph TD
 
 ## Smoke Tests
 
-The `smoke-tests` BOSH errand performs a full S3 round trip against the
-cluster with the root key, so it needs no extra key setup. It consumes the
-`garage-rpc` link and the `garage.access_key`, `garage.secret_key`, and
-`garage.default_bucket` properties. Run it with:
+The `smoke-tests` BOSH errand performs a full S3 round trip against the cluster with the root key, so it needs no extra key setup. It consumes the `garage-rpc` link and the `garage.access_key`, `garage.secret_key`, and `garage.default_bucket` properties. We run it with the following command:
 
 ```bash
 bosh -d <deployment> run-errand smoke-tests
 ```
 
-The errand:
+The errand takes these steps.
 
-1. Probes `GET http://<peer>:3900/` on every peer and fails if any peer does
-   not answer.
-2. Uploads a small object with a unique key (`smoke-<epoch>-<pid>`) to the
-   default bucket via PutObject.
-3. Downloads it via GetObject and compares the content.
-4. Deletes it via DeleteObject.
-5. Confirms it is gone via HeadObject, which must return 404.
+1. It probes `GET http://<peer>:3900/` on every peer and fails if any peer does not answer.
+
+2. It uploads a small object with a unique key (`smoke-<epoch>-<pid>`) to the default bucket via PutObject.
+
+3. It downloads the object via GetObject and compares the content.
+
+4. It deletes the object via DeleteObject.
+
+5. It confirms the object is gone via HeadObject, which must return 404.
 
 Auth uses AWS Signature Version 4, signed with HMACs computed in bash over `openssl dgst -sha256`. No packages beyond the stemcell's base tools are needed. The errand has been exercised against OpenSSL 3.5 and the uutils coreutils that Ubuntu 26.04 resolute ships.
 
 ## Release Process
 
-Final releases are created by the `.github/workflows/release.yml` workflow
-on tag push. The workflow:
+The `.github/workflows/release.yml` workflow creates final releases on tag push. The workflow takes these steps.
 
-1. Installs the latest BOSH CLI.
-2. Downloads the Garage binary from the upstream CDN.
-3. Verifies the SHA256 digest.
-4. Runs `bosh add-blob` and `bosh upload-blobs`.
-5. Runs `bosh create-release --final --version <tag>`.
-6. Publishes the `.tgz` and its SHA256 checksum to GitHub Releases.
+1. It installs the latest BOSH CLI.
 
-To trigger a release: push a `v`-prefixed tag (e.g., `git tag v0.2.0 && git push --tags`).
+2. It downloads the Garage binary from the upstream CDN.
+
+3. It verifies the SHA256 digest.
+
+4. It runs `bosh add-blob` and `bosh upload-blobs`.
+
+5. It runs `bosh create-release --final --version <tag>`.
+
+6. It publishes the `.tgz` and its SHA256 checksum to GitHub Releases.
+
+To trigger a release, we push a `v`-prefixed tag (for example, `git tag v0.2.0 && git push --tags`).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, blob
-management instructions, and PR guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, blob management instructions, and PR guidelines.
 
 ## License
 

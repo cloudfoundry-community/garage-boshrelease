@@ -1,7 +1,6 @@
 # Contributing to garage-boshrelease
 
-This document covers the development workflow, blob management, and release
-process for garage-boshrelease.
+This document covers the development workflow, blob management, and release process for garage-boshrelease.
 
 ## Prerequisites
 
@@ -12,8 +11,7 @@ process for garage-boshrelease.
 
 ## Blob Management
 
-Blobs are not stored in git. Use `scripts/fetch blobs` to download the
-Garage binary and register it with the BOSH CLI:
+Blobs are not stored in git. Use `scripts/fetch blobs` to download the Garage binary and register it with the BOSH CLI:
 
 ```bash
 # Fetch default version (v2.3.0) for x86_64
@@ -37,12 +35,9 @@ make download-blobs VERSION=1.3.2    # different version
 make download-blobs-all              # both arches
 ```
 
-The script downloads the binary from `https://garagehq.deuxfleurs.fr/_releases/`,
-computes the SHA256 digest with Python's stdlib `hashlib`, and runs
-`bosh add-blob`. It prints the full `blobs.yml` entry on success so you
-can verify the sha field.
+The script downloads the binary from `https://garagehq.deuxfleurs.fr/_releases/`, computes the SHA256 digest with Python's stdlib `hashlib`, and runs `bosh add-blob`. On success it prints the full `blobs.yml` entry, so we can verify the sha field.
 
-To upload blobs to the S3 blobstore (requires `config/private.yml`):
+To upload blobs to the S3 blobstore, which requires `config/private.yml`, we run the following:
 
 ```bash
 cp config/private.yml.example config/private.yml
@@ -61,7 +56,7 @@ bosh -e <your-director> upload-release
 
 ## Running Unit Specs
 
-Template rendering specs live in `spec/jobs/`. Run them with:
+Template rendering specs live in `spec/jobs/`. We run them with the following command:
 
 ```bash
 bundle exec rspec spec/
@@ -72,7 +67,7 @@ Add specs when adding or modifying job templates.
 
 ## Final Release
 
-Final releases are created by CI on tag push. To create one locally:
+Final releases are created by CI on tag push. To create one locally, we run the following:
 
 ```bash
 # Populate config/private.yml with S3 credentials first
@@ -88,6 +83,5 @@ git push --tags
 - Keep each PR focused on a single logical concern.
 - Include or update `spec/` tests for any job template changes.
 - Update `CHANGELOG.md` with a summary of changes under the relevant version.
-- Do not commit `config/private.yml`, `blobs/`, `.dev_builds/`, or
-  `.final_builds/`.
+- Do not commit `config/private.yml`, `blobs/`, `.dev_builds/`, or `.final_builds/`.
 - Run `python3 -c "import ast; ast.parse(open('scripts/fetch').read())"` before submitting `scripts/fetch` changes.
