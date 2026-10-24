@@ -135,7 +135,7 @@ All notable changes to garage-boshrelease are documented here.
   The job properties now feed the `GARAGE_DEFAULT_ACCESS_KEY`, `GARAGE_DEFAULT_SECRET_KEY`, and `GARAGE_DEFAULT_BUCKET` env vars, so Garage auto-provisions the root S3 key and default bucket on first start.
 
 - `jobs/garage` bpm
-  The `--single-node` server flag is now emitted automatically when the `garage-rpc` link has exactly one instance, which enables single-node layout auto-assignment. The `--default-bucket` flag is always emitted to trigger bucket auto-creation.
+  The `--single-node` server flag is now emitted automatically when the `garage-rpc` link has exactly one instance, which enables single-node layout auto-assignment. The `--default-bucket` flag comes with it to trigger bucket auto-creation, and it's emitted only in single-node mode.
 
 - `jobs/garage` properties
   This release adds `garage.access_key` (no default), `garage.secret_key` (no default), and `garage.default_bucket` (default `garage`).
